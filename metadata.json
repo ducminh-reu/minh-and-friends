@@ -1,0 +1,8 @@
+{
+  "name": "RUSSIAN DICTATION",
+  "description": "Nền tảng luyện nghe chép chính tả tiếng Nga chuẩn CEFR B1–C2 với phân tích lỗi ngữ pháp song ngữ Nga–Việt, sổ tay từ vựng SRS và tạo bài học thích ứng.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
