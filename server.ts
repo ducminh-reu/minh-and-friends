@@ -27,8 +27,31 @@ import {
   startDailyNewsScheduler,
 } from './server/newsPipelineService.ts';
 import { fetchDailyNewsArticles } from './server/newsRssService.ts';
-import { CONFIGURED_TTS_MODEL, TtsQuotaError, ttsProvider } from './server/ttsProvider.ts';
-import type { CefrLevel, NewsTopicCategory, TopicCategory } from './src/types/domain.ts';
+import {
+  CONFIGURED_TTS_MODEL,
+  SECONDARY_FREE_TTS_MODEL,
+  TtsQuotaError,
+  getTtsCacheStats,
+  ttsProvider,
+} from './server/ttsProvider.ts';
+import {
+  generateTtsQaSamples,
+  listTtsQaSamples,
+  resolveSafeQaAudioPath,
+} from './server/ttsQaSuite.ts';
+import type {
+  CefrLevel,
+  GeminiVoiceId,
+  NewsTopicCategory,
+  TopicCategory,
+  TtsModelId,
+  VoiceAgeStyle,
+  VoiceSpeakingStyle,
+} from './src/types/domain.ts';
+import {
+  RUSSIAN_VOICE_REGISTRY,
+  isValidGeminiVoiceId,
+} from './src/utils/voiceRegistry.ts';
 import {
   filterNewsArticles,
   parseVerifiedRssDate,
@@ -94,12 +117,16 @@ async function createServer() {
     const supabaseConfigured = Boolean(
       process.env.VITE_SUPABASE_URL && process.env.VITE_SUPABASE_ANON_KEY,
     );
+    const cacheStats = getTtsCacheStats();
     res.json({
       status: 'ok',
       geminiConfigured,
       textModel: CONFIGURED_TEXT_MODEL,
       ttsAvailable: ttsProvider.isAvailable(),
       ttsProvider: CONFIGURED_TTS_MODEL,
+      secondaryTtsModel: SECONDARY_FREE_TTS_MODEL,
+      freeTierOnly: true,
+      ttsCacheStats: cacheStats,
       supabaseConfigured,
       mode: geminiConfigured || supabaseConfigured ? 'hybrid' : 'demo',
     });
@@ -110,8 +137,11 @@ async function createServer() {
     const verifyModels = req.query.verifyModels === '1';
     const base = {
       configured: isGeminiConfigured(),
+      freeTierOnly: true,
       textModel: CONFIGURED_TEXT_MODEL,
       ttsModel: CONFIGURED_TTS_MODEL,
+      secondaryTtsModel: SECONDARY_FREE_TTS_MODEL,
+      ttsCacheStats: getTtsCacheStats(),
       ttsQueue: globalTtsQueue.getSnapshot(),
       recentMonitoring: getRecentGeminiMonitoringEvents(30),
     };
@@ -121,18 +151,117 @@ async function createServer() {
       return;
     }
 
-    const [textVerification, ttsVerification] = await Promise.all([
+    const [textVerification, primaryTtsVerification, secondaryTtsVerification] = await Promise.all([
       verifyGeminiModelMetadata(CONFIGURED_TEXT_MODEL),
       verifyGeminiModelMetadata(CONFIGURED_TTS_MODEL),
+      verifyGeminiModelMetadata(SECONDARY_FREE_TTS_MODEL),
     ]);
 
     res.json({
       ...base,
       modelVerification: {
         text: textVerification,
-        tts: ttsVerification,
+        tts: primaryTtsVerification,
+        ttsSecondary: secondaryTtsVerification,
       },
     });
+  });
+
+  app.get('/api/tts/voices', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      provider: 'gemini-tts',
+      primaryModel: CONFIGURED_TTS_MODEL,
+      secondaryModel: SECONDARY_FREE_TTS_MODEL,
+      freeTierOnly: true,
+      locale: 'ru-RU',
+      voices: Object.values(RUSSIAN_VOICE_REGISTRY),
+      cacheStats: getTtsCacheStats(),
+    });
+  });
+
+  app.get('/api/tts/qa/samples', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const payload = listTtsQaSamples();
+    res.json({
+      ...payload,
+      primaryModel: CONFIGURED_TTS_MODEL,
+      secondaryModel: SECONDARY_FREE_TTS_MODEL,
+      cacheStats: getTtsCacheStats(),
+      ttsQueue: globalTtsQueue.getSnapshot(),
+    });
+  });
+
+  app.post('/api/tts/qa/generate', async (req, res) => {
+    if (!ttsProvider.isAvailable()) {
+      res.status(503).json({
+        error: 'TTS_NOT_CONFIGURED',
+        message: 'Chưa cấu hình GEMINI_API_KEY trên máy chủ.',
+      });
+      return;
+    }
+    const { sampleIds, force, maxCount } = req.body ?? {};
+    const validIds = Array.isArray(sampleIds)
+      ? sampleIds.filter((x: unknown): x is string => typeof x === 'string').slice(0, 35)
+      : undefined;
+    try {
+      const outcome = await generateTtsQaSamples({
+        sampleIds: validIds,
+        force: Boolean(force),
+        maxCount:
+          typeof maxCount === 'number' && Number.isFinite(maxCount)
+            ? Math.min(35, Math.max(1, Math.floor(maxCount)))
+            : undefined,
+      });
+      res.json({
+        ...outcome,
+        cacheStats: getTtsCacheStats(),
+        qa: listTtsQaSamples(),
+      });
+    } catch (err) {
+      sendClassifiedUpstreamError(
+        res,
+        err,
+        'QA_GENERATION_FAILED',
+        'Không thể tạo mẫu kiểm thử âm thanh lúc này.',
+      );
+    }
+  });
+
+  app.get('/api/tts/qa/audio/:sampleId', (req, res) => {
+    const filePath = resolveSafeQaAudioPath(req.params.sampleId);
+    if (!filePath || !fs.existsSync(filePath)) {
+      res.status(404).json({ error: 'QA_AUDIO_NOT_FOUND', message: 'Mẫu âm thanh chưa được tạo.' });
+      return;
+    }
+    const stat = fs.statSync(filePath);
+    const total = stat.size;
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+
+    const range = req.headers.range;
+    if (range) {
+      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+      if (!match) {
+        res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
+        return;
+      }
+      const start = match[1] ? Number(match[1]) : 0;
+      const end = match[2] ? Math.min(total - 1, Number(match[2])) : total - 1;
+      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= total) {
+        res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
+        return;
+      }
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+      res.setHeader('Content-Length', String(end - start + 1));
+      fs.createReadStream(filePath, { start, end }).pipe(res);
+      return;
+    }
+
+    res.setHeader('Content-Length', String(total));
+    fs.createReadStream(filePath).pipe(res);
   });
 
   function normalizeSupabaseUrl(raw: string | undefined): string | null {
@@ -568,8 +697,8 @@ async function createServer() {
     if (!ttsProvider.isAvailable()) {
       res.status(503).json({
         error: 'TTS_NOT_CONFIGURED',
-        message:
-          'Server TTS chưa được cấu hình GEMINI_API_KEY. Đang chuyển sang giọng đọc trình duyệt hoặc mô phỏng thời lượng.',
+        errorCategory: 'auth_error',
+        message: 'Server Gemini TTS chưa được cấu hình GEMINI_API_KEY.',
       });
       return;
     }
@@ -578,11 +707,16 @@ async function createServer() {
       text,
       voiceName,
       gender,
+      ageStyle,
+      speakingStyle,
+      speakingRate,
+      emotion,
       speakerRole,
       topic,
       previousSpeaker,
       previousText,
       style,
+      modelOverride,
       lessonId,
       cefrLevel,
     } = req.body ?? {};
@@ -591,11 +725,31 @@ async function createServer() {
       return;
     }
 
+    const safeAgeStyle: VoiceAgeStyle | undefined =
+      ageStyle === 'young' || ageStyle === 'mature' ? ageStyle : undefined;
+    const safeSpeakingStyle: VoiceSpeakingStyle | undefined =
+      speakingStyle === 'conversational' ||
+      speakingStyle === 'narration' ||
+      speakingStyle === 'educational'
+        ? speakingStyle
+        : undefined;
+    const safeModelOverride: TtsModelId | undefined =
+      modelOverride === 'gemini-3.8-flash-lite-tts' || modelOverride === 'gemini-3.8-flash-tts'
+        ? modelOverride
+        : undefined;
+
     try {
       const result = await ttsProvider.synthesize({
         text,
-        voiceName,
+        voiceName: isValidGeminiVoiceId(voiceName) ? voiceName : undefined,
         gender: gender === 'female' || gender === 'male' ? gender : undefined,
+        ageStyle: safeAgeStyle,
+        speakingStyle: safeSpeakingStyle,
+        speakingRate:
+          typeof speakingRate === 'number' && Number.isFinite(speakingRate)
+            ? speakingRate
+            : undefined,
+        emotion: typeof emotion === 'string' ? emotion.slice(0, 40) : undefined,
         speakerRole: typeof speakerRole === 'string' ? speakerRole.slice(0, 100) : undefined,
         topic: typeof topic === 'string' ? topic.slice(0, 80) : undefined,
         previousSpeaker:
@@ -603,6 +757,7 @@ async function createServer() {
         previousText:
           typeof previousText === 'string' ? previousText.slice(0, 200) : undefined,
         style: typeof style === 'string' ? style.slice(0, 160) : undefined,
+        modelOverride: safeModelOverride,
         lessonId: typeof lessonId === 'string' ? lessonId.slice(0, 96) : undefined,
         cefrLevel: ALLOWED_LEVELS.has(cefrLevel) ? cefrLevel : undefined,
       });
@@ -616,32 +771,52 @@ async function createServer() {
     if (!ttsProvider.isAvailable()) {
       res.status(503).json({
         error: 'TTS_NOT_CONFIGURED',
-        message: 'Server TTS chưa được cấu hình GEMINI_API_KEY.',
+        errorCategory: 'auth_error',
+        message: 'Server Gemini TTS chưa được cấu hình GEMINI_API_KEY.',
       });
       return;
     }
 
-    const { speakers, turns, topic, lessonId, cefrLevel } = req.body ?? {};
+    const { speakers, turns, topic, lessonId, cefrLevel, modelOverride } = req.body ?? {};
     if (
       !Array.isArray(speakers) ||
-      speakers.length !== 2 ||
+      speakers.length < 1 ||
+      speakers.length > 6 ||
       !Array.isArray(turns) ||
       turns.length === 0 ||
-      turns.length > 16
+      turns.length > 24
     ) {
       res.status(400).json({
         error: 'INVALID_DIALOGUE',
-        message: 'Dialogue TTS requires exactly 2 speakers and 1–16 turns.',
+        message: 'Dialogue TTS requires 1–6 speakers and 1–24 turns.',
       });
       return;
     }
+
+    const safeModelOverride: TtsModelId | undefined =
+      modelOverride === 'gemini-3.8-flash-lite-tts' || modelOverride === 'gemini-3.8-flash-tts'
+        ? modelOverride
+        : undefined;
 
     try {
       const result = await ttsProvider.synthesizeDialogue({
         speakers: speakers.map((sp: Record<string, unknown>) => ({
           speaker: String(sp.speaker ?? '').slice(0, 60),
-          voiceName: sp.voiceName as 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr' | undefined,
+          voiceName: isValidGeminiVoiceId(sp.voiceName) ? (sp.voiceName as GeminiVoiceId) : undefined,
           gender: sp.gender === 'female' ? 'female' : 'male',
+          ageStyle:
+            sp.ageStyle === 'young' || sp.ageStyle === 'mature' ? sp.ageStyle : undefined,
+          speakingStyle:
+            sp.speakingStyle === 'conversational' ||
+            sp.speakingStyle === 'narration' ||
+            sp.speakingStyle === 'educational'
+              ? sp.speakingStyle
+              : undefined,
+          speakingRate:
+            typeof sp.speakingRate === 'number' && Number.isFinite(sp.speakingRate)
+              ? sp.speakingRate
+              : undefined,
+          emotion: typeof sp.emotion === 'string' ? sp.emotion.slice(0, 40) : undefined,
           role: typeof sp.role === 'string' ? sp.role.slice(0, 100) : undefined,
         })),
         turns: turns.map((t: Record<string, unknown>) => ({
@@ -649,6 +824,7 @@ async function createServer() {
           text: String(t.text ?? '').slice(0, 600),
         })),
         topic: typeof topic === 'string' ? topic.slice(0, 80) : undefined,
+        modelOverride: safeModelOverride,
         lessonId: typeof lessonId === 'string' ? lessonId.slice(0, 96) : undefined,
         cefrLevel: ALLOWED_LEVELS.has(cefrLevel) ? cefrLevel : undefined,
       });
@@ -690,8 +866,25 @@ async function createServer() {
   if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: false, ws: false },
       appType: 'spa',
+    });
+    app.get('/@vite/client', async (_req, res, next) => {
+      try {
+        const result = await vite.transformRequest('/@vite/client');
+        if (!result?.code) {
+          next();
+          return;
+        }
+        const patched = result.code.replace(
+          /const transport = normalizeModuleRunnerTransport\(\(\(\) => \{[\s\S]*?\}\)\(\)\);/,
+          'const transport = normalizeModuleRunnerTransport({ async connect() {}, async disconnect() {}, send() {} });',
+        );
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+        res.send(patched);
+      } catch (err) {
+        next(err);
+      }
     });
     app.use(vite.middlewares);
   } else {

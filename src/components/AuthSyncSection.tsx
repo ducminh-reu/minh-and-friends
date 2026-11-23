@@ -261,31 +261,12 @@ export const AuthSyncSection: React.FC = () => {
         </form>
       )}
 
-      {/* Missing Remote Schema Warning */}
-      {schemaStatus && schemaStatus.configured && schemaStatus.reachable && !schemaStatus.schemaReady && (
-        <div
-          role="alert"
-          className="p-4 rounded-xl border border-amber-300 bg-amber-50 text-xs text-amber-950 space-y-2"
-        >
-          <div className="font-semibold flex items-center gap-1.5">
-            <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" aria-hidden="true" />
-            <span>Cần chạy SQL Schema trên Supabase Project trước khi đồng bộ bảng</span>
-          </div>
-          <p className="leading-relaxed">
-            Hệ thống đã kết nối được tới Supabase Auth nhưng chưa tìm thấy các bảng:{' '}
-            <span className="font-mono">{schemaStatus.missingTables.join(', ')}</span>. Hãy sao chép SQL Schema ở phần bên dưới và chạy trong Supabase Dashboard → SQL Editor.
-          </p>
-        </div>
-      )}
-
-      {/* Authenticated Account View vs Auth Form */}
       {!capabilities.supabaseConfigured && capabilities.loaded ? (
         <div className="p-4 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-600">
-          Chưa cấu hình biến môi trường <span className="font-mono">VITE_SUPABASE_URL</span> và{' '}
-          <span className="font-mono">VITE_SUPABASE_ANON_KEY</span>. Ứng dụng vẫn hoạt động đầy đủ ở chế độ lưu cục bộ (localStorage & IndexedDB).
+          Tiến trình học tập và từ vựng của bạn được lưu trữ an toàn trên thiết bị. Bạn có thể đăng nhập để đồng bộ qua đám mây bất cứ lúc nào.
         </div>
       ) : authLoading ? (
-        <div className="text-xs text-slate-500 py-2">Đang kiểm tra phiên đăng nhập Supabase...</div>
+        <div className="text-xs text-slate-500 py-2">Đang tải thông tin tài khoản...</div>
       ) : authUser ? (
         <div className="space-y-4">
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">

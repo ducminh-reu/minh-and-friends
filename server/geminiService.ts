@@ -5,9 +5,12 @@ import type {
   LessonQualityChecks,
   NewsArticle,
   NewsFormat,
+  SpeakerProfile,
   TopicCategory,
 } from '../src/types/domain.ts';
 import { mapNewsTopicToLessonTopic } from '../src/utils/newsFeedUtils.ts';
+import { findSpeakerProfile, inferRussianSpeakerGender } from '../src/utils/speakerUtils.ts';
+import { assignDistinctSpeakerVoices } from '../src/utils/voiceRegistry.ts';
 import {
   classifyGeminiError,
   computeBackoffDelayMs,
@@ -58,30 +61,8 @@ export function createGeminiTtsClient(timeoutMs?: number): GoogleGenAI {
   });
 }
 
-const KNOWN_FEMALE_RUSSIAN_NAMES = new Set([
-  'анна', 'елена', 'мария', 'наталья', 'ольга', 'оля', 'катя', 'екатерина',
-  'ирина', 'светлана', 'татьяна', 'вера', 'дарья', 'анастасия', 'софья',
-  'софия', 'виктория', 'юлия', 'полина', 'алина', 'ксения', 'марина',
-  'людмила', 'валентина', 'галина', 'надежда', 'лариса', 'евгения', 'валерия',
-]);
-
 export function resolveSpeakerGender(rawGender: string | undefined, name: string): 'male' | 'female' {
-  const g = (rawGender ?? '').trim().toLowerCase();
-  if (['female', 'f', 'woman', 'женский', 'жен', 'ж', 'nữ', 'nu'].includes(g)) {
-    return 'female';
-  }
-  if (['male', 'm', 'man', 'мужской', 'муж', 'м', 'nam'].includes(g)) {
-    return 'male';
-  }
-  const cleanFirst = name
-    .replace(/\u0301/g, '')
-    .trim()
-    .split(/\s+/)[0]
-    ?.toLowerCase() ?? '';
-  if (KNOWN_FEMALE_RUSSIAN_NAMES.has(cleanFirst)) {
-    return 'female';
-  }
-  return 'male';
+  return inferRussianSpeakerGender(rawGender, name);
 }
 
 async function withAbortTimeout<T>(
@@ -432,26 +413,16 @@ Requirements:
   const raw = JSON.parse((response.text ?? '{}').trim());
   const lessonId = `ai-${input.level.toLowerCase()}-${Date.now()}`;
 
-  const femaleVoices = ['Kore', 'Zephyr'] as const;
-  const maleVoices = ['Puck', 'Charon', 'Fenrir'] as const;
-  let femaleIdx = 0;
-  let maleIdx = 0;
-
-  const speakers = (raw.speakers ?? []).slice(0, input.speakersCount).map(
-    (sp: { name: string; roleVi: string; roleEn: string; gender: string }) => {
-      const gender = resolveSpeakerGender(sp.gender, sp.name);
-      const voiceName =
-        gender === 'female'
-          ? femaleVoices[femaleIdx++ % femaleVoices.length]
-          : maleVoices[maleIdx++ % maleVoices.length];
-      return {
-        name: sp.name,
-        roleVi: sp.roleVi,
-        roleEn: sp.roleEn,
-        gender,
-        voiceName,
-      };
-    },
+  const rawSpeakerList: Array<{ name: string; roleVi: string; roleEn: string; gender: string }> =
+    Array.isArray(raw.speakers) ? raw.speakers.slice(0, input.speakersCount) : [];
+  const speakers: SpeakerProfile[] = assignDistinctSpeakerVoices(
+    rawSpeakerList.map((sp) => ({
+      name: sp.name,
+      roleVi: sp.roleVi,
+      roleEn: sp.roleEn,
+      gender: resolveSpeakerGender(sp.gender, sp.name),
+      speakingStyle: 'conversational' as const,
+    })),
   );
 
   let cursorSec = 0;
@@ -462,10 +433,11 @@ Requirements:
     ) => {
       const wordCount = Math.max(4, s.text.split(/\s+/).length);
       const duration = Math.max(7, Math.round(wordCount * 0.68));
+      const matchedSpeaker = findSpeakerProfile(speakers, s.speaker);
       const item = {
         id: `${lessonId}-s${idx + 1}`,
         order: idx + 1,
-        speaker: s.speaker,
+        speaker: matchedSpeaker?.name ?? s.speaker,
         text: s.text,
         translationVi: s.translationVi,
         startSec: cursorSec,
@@ -786,27 +758,19 @@ REQUIREMENTS:
   const raw = JSON.parse((response.text ?? '{}').trim());
   const lessonId = `news-${level.toLowerCase()}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
-  const femaleVoices = ['Kore', 'Zephyr'] as const;
-  const maleVoices = ['Puck', 'Charon', 'Fenrir'] as const;
-  let femaleIdx = 0;
-  let maleIdx = 0;
-
   const maxSpeakers = format === 'dialogue' ? 2 : 1;
-  const speakers = (raw.speakers ?? []).slice(0, maxSpeakers).map(
-    (sp: { name: string; roleVi: string; roleEn: string; gender: string }) => {
-      const gender = resolveSpeakerGender(sp.gender, sp.name);
-      const voiceName =
-        gender === 'female'
-          ? femaleVoices[femaleIdx++ % femaleVoices.length]
-          : maleVoices[maleIdx++ % maleVoices.length];
-      return {
-        name: sp.name,
-        roleVi: sp.roleVi,
-        roleEn: sp.roleEn,
-        gender,
-        voiceName,
-      };
-    },
+  const rawNewsSpeakers: Array<{ name: string; roleVi: string; roleEn: string; gender: string }> =
+    Array.isArray(raw.speakers) ? raw.speakers.slice(0, maxSpeakers) : [];
+  const speakers: SpeakerProfile[] = assignDistinctSpeakerVoices(
+    rawNewsSpeakers.map((sp) => ({
+      name: sp.name,
+      roleVi: sp.roleVi,
+      roleEn: sp.roleEn,
+      gender: resolveSpeakerGender(sp.gender, sp.name),
+      speakingStyle: (format === 'summary' ? 'narration' : 'conversational') as
+        | 'narration'
+        | 'conversational',
+    })),
   );
 
   let cursorSec = 0;
@@ -817,10 +781,12 @@ REQUIREMENTS:
     ) => {
       const wordCount = Math.max(5, s.text.split(/\s+/).length);
       const duration = Math.max(8, Math.round(wordCount * 0.72));
+      const matchedSpeaker =
+        format === 'summary' ? speakers[0] : findSpeakerProfile(speakers, s.speaker);
       const item = {
         id: `${lessonId}-s${idx + 1}`,
         order: idx + 1,
-        speaker: speakers[0]?.name && format === 'summary' ? speakers[0].name : s.speaker,
+        speaker: matchedSpeaker?.name ?? s.speaker,
         text: s.text,
         translationVi: s.translationVi,
         startSec: cursorSec,

@@ -323,7 +323,7 @@ export function classifyGeminiError(err: unknown): ClassifiedGeminiError {
         quotaMetric,
         safeMessage,
         userMessageVi:
-          'Hạn mức ngày (Daily Quota) hoặc gói cước của Gemini API đã hết (429 RESOURCE_EXHAUSTED). Văn bản bài học vẫn được lưu nguyên vẹn; bạn có thể tạo lại audio sau khi hạn mức được làm mới hoặc nâng cấp gói API.',
+          'Hạn mức miễn phí (Free Tier) của Gemini TTS đã hết (429 RESOURCE_EXHAUSTED). Văn bản bài học vẫn được giữ nguyên; vui lòng thử lại sau khi hạn mức được làm mới.',
       };
     }
 
@@ -490,14 +490,23 @@ export function recordGeminiMonitoringEvent(
     monitoringEvents.length = MAX_MONITORING_EVENTS;
   }
 
-  const logPayload = JSON.stringify({
-    event: 'gemini_api_call',
-    ...fullEvent,
-  });
   if (fullEvent.outcome === 'failed') {
-    console.warn(logPayload);
+    const isExpectedQuotaState =
+      fullEvent.errorCategory === 'daily_quota_exhausted' ||
+      fullEvent.errorCategory === 'rate_limit_temporary';
+    if (isExpectedQuotaState) {
+      console.log(
+        `[gemini] quota_limit type=${fullEvent.requestType} model=${fullEvent.model} status=${fullEvent.httpStatus ?? 429} category=${fullEvent.errorCategory} retries=${fullEvent.retryCount} ms=${fullEvent.processingDurationMs}`,
+      );
+    } else {
+      console.warn(
+        `[gemini] upstream_issue type=${fullEvent.requestType} model=${fullEvent.model} status=${fullEvent.httpStatus ?? 'n/a'} category=${fullEvent.errorCategory} retries=${fullEvent.retryCount} ms=${fullEvent.processingDurationMs}`,
+      );
+    }
   } else {
-    console.log(logPayload);
+    console.log(
+      `[gemini] ok type=${fullEvent.requestType} model=${fullEvent.model} status=${fullEvent.httpStatus ?? 200} cached=${fullEvent.reusedFromCache} ms=${fullEvent.processingDurationMs}`,
+    );
   }
 
   return fullEvent;
@@ -545,6 +554,7 @@ export class TtsRequestQueue {
   private cooldownUntilMs = 0;
   private dailyQuotaExhaustedUntilMs = 0;
   private dailyQuotaExhaustedModel: string | null = null;
+  private readonly dailyQuotaByModel = new Map<string, number>();
 
   private readonly pendingQueue: InternalQueueItem<unknown>[] = [];
   private readonly activeJobs = new Map<string, TtsQueueJobRecord>();
@@ -558,7 +568,7 @@ export class TtsRequestQueue {
     const configured =
       options.maxConcurrency ??
       (Number.isFinite(envConcurrency) && envConcurrency >= 1
-        ? Math.min(2, Math.floor(envConcurrency))
+        ? Math.min(1, Math.floor(envConcurrency))
         : 1);
     this.maxConcurrency = Math.max(1, configured);
     this.minGapMs = options.minGapMs ?? 1200;
@@ -570,8 +580,15 @@ export class TtsRequestQueue {
     return this.maxConcurrency;
   }
 
-  isDailyQuotaBlocked(): boolean {
-    if (this.dailyQuotaExhaustedUntilMs > Date.now()) {
+  isDailyQuotaBlocked(model?: string): boolean {
+    const now = Date.now();
+    if (model) {
+      const modelUntil = this.dailyQuotaByModel.get(model) ?? 0;
+      if (modelUntil > now) return true;
+      if (modelUntil > 0) this.dailyQuotaByModel.delete(model);
+      return false;
+    }
+    if (this.dailyQuotaExhaustedUntilMs > now) {
       return true;
     }
     if (this.dailyQuotaExhaustedUntilMs > 0) {
@@ -581,10 +598,19 @@ export class TtsRequestQueue {
     return false;
   }
 
-  clearQuotaCooldown(): void {
+  clearQuotaCooldown(model?: string): void {
+    if (model) {
+      this.dailyQuotaByModel.delete(model);
+      if (this.dailyQuotaExhaustedModel === model) {
+        this.dailyQuotaExhaustedUntilMs = 0;
+        this.dailyQuotaExhaustedModel = null;
+      }
+      return;
+    }
     this.cooldownUntilMs = 0;
     this.dailyQuotaExhaustedUntilMs = 0;
     this.dailyQuotaExhaustedModel = null;
+    this.dailyQuotaByModel.clear();
   }
 
   noteRateLimitCooldown(delayMs: number): void {
@@ -592,8 +618,14 @@ export class TtsRequestQueue {
     this.cooldownUntilMs = Math.max(this.cooldownUntilMs, Date.now() + safeDelay);
   }
 
-  noteDailyQuotaExhausted(model: string): void {
-    this.dailyQuotaExhaustedUntilMs = Date.now() + this.dailyQuotaCooldownMs;
+  noteDailyQuotaExhausted(model: string, retryAfterMs?: number | null): void {
+    const effectiveMs =
+      typeof retryAfterMs === 'number' && Number.isFinite(retryAfterMs) && retryAfterMs > 0
+        ? Math.min(60 * 60 * 1000, Math.max(this.dailyQuotaCooldownMs, retryAfterMs))
+        : this.dailyQuotaCooldownMs;
+    const until = Date.now() + effectiveMs;
+    this.dailyQuotaByModel.set(model, until);
+    this.dailyQuotaExhaustedUntilMs = until;
     this.dailyQuotaExhaustedModel = model;
   }
 
@@ -795,7 +827,10 @@ export class TtsRequestQueue {
     } catch (err) {
       const finishedAtMs = Date.now();
       const startedAtMs = record.startedAt ? Date.parse(record.startedAt) : finishedAtMs;
-      const classified = classifyGeminiError(err);
+      const classified =
+        err && typeof err === 'object' && 'classified' in err && (err as { classified?: ClassifiedGeminiError }).classified
+          ? (err as { classified: ClassifiedGeminiError }).classified
+          : classifyGeminiError(err);
       const retryCount =
         err && typeof err === 'object' && typeof (err as { retryCount?: unknown }).retryCount === 'number'
           ? (err as { retryCount: number }).retryCount
@@ -810,7 +845,7 @@ export class TtsRequestQueue {
       this.lastCallFinishedAtMs = finishedAtMs;
 
       if (classified.category === 'daily_quota_exhausted') {
-        this.noteDailyQuotaExhausted(record.model);
+        this.noteDailyQuotaExhausted(record.model, classified.retryAfterMs);
       } else if (classified.category === 'rate_limit_temporary') {
         this.noteRateLimitCooldown(classified.retryAfterMs ?? 5000);
       }

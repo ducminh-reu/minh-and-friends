@@ -428,12 +428,9 @@ test('7 & 8. Retry failed audio preserves text, reuses cached audio without API 
     const validBase64 = makeValidBase64Wav(1.5);
 
     const mockProvider: TtsProvider = {
-      name: 'gemini-3.8-flash-tts',
+      name: 'gemini-3.8-flash-lite-tts',
       isAvailable: () => true,
-      synthesize: async (): Promise<TtsSynthesisResult> => {
-        throw new Error('Unexpected single synthesize call for 2-speaker lesson');
-      },
-      synthesizeDialogue: async (): Promise<TtsSynthesisResult> => {
+      synthesize: async (input): Promise<TtsSynthesisResult> => {
         providerCalls += 1;
         if (mode === 'fail_429') {
           throw new TtsQuotaError(
@@ -451,9 +448,12 @@ test('7 & 8. Retry failed audio preserves text, reuses cached audio without API 
           audioBase64: validBase64,
           mimeType: 'audio/wav',
           cached: false,
-          provider: 'gemini-3.8-flash-tts',
+          provider: 'gemini-3.8-flash-lite-tts',
           retryCount: 0,
         };
+      },
+      synthesizeDialogue: async (): Promise<TtsSynthesisResult> => {
+        throw new Error('Per-turn synthesize should be used to preserve exact sentence boundaries');
       },
     };
 
@@ -469,7 +469,7 @@ test('7 & 8. Retry failed audio preserves text, reuses cached audio without API 
     assert.equal(failedRes.lesson.vocabulary.length, 1);
     assert.equal(providerCalls, 1);
 
-    // Step B: Retry audio succeeds -> creates valid WAV files on disk
+    // Step B: Retry audio succeeds -> creates exact per-sentence + stitched full WAV files on disk
     mode = 'succeed';
     const retrySuccess = await synthesizeAndSplitLessonAudio(failedRes.lesson, null, {
       providerOverride: mockProvider,
@@ -480,7 +480,8 @@ test('7 & 8. Retry failed audio preserves text, reuses cached audio without API 
     assert.equal(retrySuccess.segmentsSaved, 2);
     assert.equal(retrySuccess.lesson.newsMetadata?.audioStatus, 'ready');
     assert.ok(retrySuccess.lesson.newsMetadata?.fullAudioUrl?.endsWith('/full.wav'));
-    assert.equal(providerCalls, 2);
+    // 1 failed call in Step A + 2 exact per-turn calls in Step B
+    assert.equal(providerCalls, 3);
 
     const fullPath = resolveSafeAudioFilePath(testLessonId, 'full.wav')!;
     const seg1Path = resolveSafeAudioFilePath(testLessonId, 's-1.wav')!;
@@ -497,7 +498,7 @@ test('7 & 8. Retry failed audio preserves text, reuses cached audio without API 
     });
     assert.equal(reusedRes.reusedFromCache, true);
     assert.equal(reusedRes.error, null);
-    assert.equal(providerCalls, 2, 'Cached valid audio must be reused without calling TTS API');
+    assert.equal(providerCalls, 3, 'Cached valid audio must be reused without calling TTS API');
 
     // Step D: Forced regeneration fails with 503 -> MUST NOT overwrite valid audio on disk or in metadata!
     mode = 'fail_503';

@@ -183,13 +183,19 @@ function writeFileAtomically(targetPath: string, data: Buffer): void {
 
 export function computeLessonAudioConfigHash(lesson: Lesson, ttsModel: string): string {
   const payload = JSON.stringify({
-    v: 1,
+    v: 'v4-ru-free-tier',
+    provider: 'gemini-tts',
+    locale: 'ru-RU',
     lessonId: lesson.id,
     ttsModel,
     speakers: lesson.speakers.map((s) => ({
       name: s.name.normalize('NFC').replace(/\u0301/g, '').trim(),
       voiceName: s.voiceName,
       gender: s.gender,
+      ageStyle: s.ageStyle ?? null,
+      speakingStyle: s.speakingStyle ?? null,
+      speakingRate: s.speakingRate ?? 1.0,
+      emotion: s.emotion ?? null,
     })),
     sentences: lesson.sentences.map((s) => ({
       order: s.order,

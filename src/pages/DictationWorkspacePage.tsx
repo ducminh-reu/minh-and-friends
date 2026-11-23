@@ -16,13 +16,18 @@ import {
   Newspaper,
   Pause,
   Play,
+  Plus,
   RotateCcw,
   Sparkles,
   Volume2,
 } from 'lucide-react';
 import { useAppState, type SentenceInputStyle } from '../context/AppStateContext';
 import { ERROR_CATEGORY_LABELS, NEWS_TOPIC_LABELS, TOPIC_LABELS, t } from '../i18n/translations';
-import { russianAudioEngine, type AudioEngineSource } from '../services/audioPlayer';
+import {
+  russianAudioEngine,
+  type AudioEngineSource,
+  type AudioSourceMetadata,
+} from '../services/audioPlayer';
 import type {
   DictationAnalysisReport,
   DictationErrorCategory,
@@ -36,8 +41,9 @@ import {
   resizeWordSlotValues,
   type ParsedSentenceSlots,
 } from '../utils/sentenceSlots';
-import { findSpeakerProfile, VOICE_PERSONA_LABELS_VI } from '../utils/speakerUtils';
+import { findSpeakerProfile, getVoicePersonaLabelVi } from '../utils/speakerUtils';
 import { analyzeDictationSubmission } from '../utils/transcriptDiff';
+import { getDefaultRussianNarratorSpeaker } from '../utils/voiceRegistry';
 
 const SPEEDS: PlaybackSpeed[] = [0.75, 0.85, 1, 1.15];
 const CYRILLIC_HELPER_KEYS = ['ё', 'й', 'щ', 'ъ', 'ы', 'ь', 'э', 'ю', 'я', '—', '«', '»'];
@@ -61,6 +67,8 @@ export const DictationWorkspacePage: React.FC = () => {
     clearDraft,
     recordAttempt,
     saveLessonVocabulary,
+    addCustomVocabulary,
+    updateProfile,
   } = useAppState();
 
   const lang = profile.interfaceLanguage;
@@ -91,6 +99,7 @@ export const DictationWorkspacePage: React.FC = () => {
   const [isPlayerDeckVisible, setIsPlayerDeckVisible] = useState(true);
   const [audioProgress, setAudioProgress] = useState(0);
   const [audioSource, setAudioSource] = useState<AudioEngineSource | null>(null);
+  const [audioSourceMeta, setAudioSourceMeta] = useState<AudioSourceMetadata | null>(null);
   const [audioError, setAudioError] = useState<string | null>(null);
 
   const [analysisReport, setAnalysisReport] = useState<DictationAnalysisReport | null>(null);
@@ -99,6 +108,7 @@ export const DictationWorkspacePage: React.FC = () => {
   >({});
   const [aiLoadingId, setAiLoadingId] = useState<string | null>(null);
   const [aiErrorMsg, setAiErrorMsg] = useState<string | null>(null);
+  const [addedMistakesNotice, setAddedMistakesNotice] = useState<string | null>(null);
 
   const [quizAnswers, setQuizAnswers] = useState<Record<string, number>>({});
   const [savedNoticeId, setSavedNoticeId] = useState<string | null>(null);
@@ -460,7 +470,11 @@ export const DictationWorkspacePage: React.FC = () => {
     }
   };
 
-  const playSingleSentence = async (index: number, chainNext: boolean) => {
+  const playSingleSentence = async (
+    index: number,
+    chainNext: boolean,
+    preferServerOverride?: boolean,
+  ) => {
     const target = lesson.sentences[index];
     if (!target) {
       fullPlaybackActiveRef.current = false;
@@ -479,7 +493,10 @@ export const DictationWorkspacePage: React.FC = () => {
     const speakerProfile = findSpeakerProfile(lesson.speakers, target.speaker);
     const prevSentence = index > 0 ? lesson.sentences[index - 1] : undefined;
     const topicEn = TOPIC_LABELS[lesson.topic]?.en ?? lesson.topic;
-    const preferServer = profile.ttsPreference === 'auto' && capabilities.ttsAvailable && isOnline;
+    const preferServer =
+      preferServerOverride !== undefined
+        ? preferServerOverride
+        : profile.ttsPreference === 'auto' && capabilities.ttsAvailable && isOnline;
 
     try {
       await russianAudioEngine.playSentence({
@@ -494,7 +511,10 @@ export const DictationWorkspacePage: React.FC = () => {
         speed,
         preferServerTts: preferServer,
         fallbackDurationSec: Math.max(3, target.endSec - target.startSec),
-        onSourceResolved: (src) => setAudioSource(src),
+        onSourceResolved: (src, meta) => {
+          setAudioSource(src);
+          setAudioSourceMeta(meta ?? { source: src });
+        },
         onProgress: (r) => setAudioProgress(r),
         onInterrupted: () => {
           setIsPlaying(false);
@@ -525,76 +545,6 @@ export const DictationWorkspacePage: React.FC = () => {
     }
   };
 
-  const playDialogueBlockFrom = async (startIndex: number) => {
-    const BLOCK_SIZE = 4;
-    const blockSentences = lesson.sentences.slice(startIndex, startIndex + BLOCK_SIZE);
-    if (blockSentences.length === 0) {
-      fullPlaybackActiveRef.current = false;
-      setIsPlaying(false);
-      setIsPaused(false);
-      return;
-    }
-
-    if (!isOnline) {
-      await playSingleSentence(startIndex, true);
-      return;
-    }
-
-    const topicEn = TOPIC_LABELS[lesson.topic]?.en ?? lesson.topic;
-    const nextStart = startIndex + BLOCK_SIZE;
-
-    setActiveSentenceIdx(startIndex);
-    setAudioError(null);
-    setInterruptedNotice(false);
-    setIsPaused(false);
-    setIsPlaying(true);
-    setAudioProgress(0);
-
-    try {
-      await russianAudioEngine.playDialogueBlock({
-        speakers: lesson.speakers,
-        sentences: blockSentences,
-        topic: topicEn,
-        speed,
-        onSourceResolved: (src) => setAudioSource(src),
-        onSentenceProgress: (offsetInBlock, localRatio) => {
-          setActiveSentenceIdx(startIndex + offsetInBlock);
-          setAudioProgress(localRatio);
-        },
-        onInterrupted: () => {
-          setIsPlaying(false);
-          setIsPaused(russianAudioEngine.canResume());
-          setInterruptedNotice(true);
-        },
-        onComplete: () => {
-          if (fullPlaybackActiveRef.current && nextStart < lesson.sentences.length) {
-            void playDialogueBlockFrom(nextStart);
-          } else {
-            fullPlaybackActiveRef.current = false;
-            setIsPlaying(false);
-            setIsPaused(false);
-          }
-        },
-        onFallbackToSequential: () => {
-          if (fullPlaybackActiveRef.current) {
-            void playSingleSentence(startIndex, true);
-          }
-        },
-        onError: (msg) => {
-          setAudioError(msg);
-          fullPlaybackActiveRef.current = false;
-          setIsPlaying(false);
-          setIsPaused(false);
-        },
-      });
-    } catch (err) {
-      setAudioError(err instanceof Error ? err.message : 'Không thể phát hội thoại.');
-      fullPlaybackActiveRef.current = false;
-      setIsPlaying(false);
-      setIsPaused(false);
-    }
-  };
-
   const playPersistedFullNewsAudio = async () => {
     const fullUrl = lesson.newsMetadata?.fullAudioUrl;
     if (!fullUrl) return;
@@ -613,7 +563,10 @@ export const DictationWorkspacePage: React.FC = () => {
         fullAudioUrl: fullUrl,
         topic: topicEn,
         speed,
-        onSourceResolved: (src) => setAudioSource(src),
+        onSourceResolved: (src, meta) => {
+          setAudioSource(src);
+          setAudioSourceMeta(meta ?? { source: src });
+        },
         onSentenceProgress: (idxInLesson, localRatio) => {
           setActiveSentenceIdx(idxInLesson);
           setAudioProgress(localRatio);
@@ -675,7 +628,6 @@ export const DictationWorkspacePage: React.FC = () => {
 
     setInterruptedNotice(false);
     setIsPaused(false);
-    const preferServer = profile.ttsPreference === 'auto' && capabilities.ttsAvailable && isOnline;
     if (mode === 'full') {
       fullPlaybackActiveRef.current = true;
       if (
@@ -685,15 +637,8 @@ export const DictationWorkspacePage: React.FC = () => {
         isOnline
       ) {
         void playPersistedFullNewsAudio();
-      } else if (
-        activeSentenceIdx === 0 &&
-        preferServer &&
-        lesson.speakers.length === 2 &&
-        !isDownloadedOffline &&
-        !lesson.sentences[0]?.audioUrl
-      ) {
-        void playDialogueBlockFrom(activeSentenceIdx);
       } else {
+        // Sequential per-sentence playback reuses persistent server disk & client cache across 1, 2, 3+ speakers
         void playSingleSentence(activeSentenceIdx, true);
       }
     } else {
@@ -703,21 +648,12 @@ export const DictationWorkspacePage: React.FC = () => {
   };
 
   const handleReplay = () => {
-    const preferServer = profile.ttsPreference === 'auto' && capabilities.ttsAvailable && isOnline;
     fullPlaybackActiveRef.current = mode === 'full';
     setIsPaused(false);
     setInterruptedNotice(false);
     const targetIdx = mode === 'full' ? 0 : activeSentenceIdx;
     if (mode === 'full' && lesson.newsMetadata?.fullAudioUrl && !isDownloadedOffline && isOnline) {
       void playPersistedFullNewsAudio();
-    } else if (
-      mode === 'full' &&
-      preferServer &&
-      lesson.speakers.length === 2 &&
-      !isDownloadedOffline &&
-      !lesson.sentences[0]?.audioUrl
-    ) {
-      void playDialogueBlockFrom(0);
     } else {
       void playSingleSentence(targetIdx, mode === 'full');
     }
@@ -908,7 +844,66 @@ export const DictationWorkspacePage: React.FC = () => {
   const handleResetToDictation = () => {
     setStage('dictation');
     setAnalysisReport(null);
+    setAddedMistakesNotice(null);
     sessionStartRef.current = Date.now();
+  };
+
+  const handleAddMistakesToVocabulary = () => {
+    if (!lesson || !analysisReport) return;
+    const errorWordsMap = new Map<string, { exampleRu: string; exampleVi: string; sentenceNum: number }>();
+
+    for (const sent of analysisReport.sentences) {
+      for (const tok of sent.tokens) {
+        if (tok.type === 'missing' || tok.type === 'substitute' || tok.type === 'extra') {
+          const cleanWord = tok.referenceWord?.trim();
+          if (cleanWord && cleanWord.length > 1 && !errorWordsMap.has(cleanWord.toLowerCase())) {
+            errorWordsMap.set(cleanWord.toLowerCase(), {
+              exampleRu: sent.referenceText,
+              exampleVi: lesson.titleVi,
+              sentenceNum: sent.order,
+            });
+          }
+        }
+      }
+      for (const err of sent.errors) {
+        const cleanWord = err.referenceSnippet?.trim() || err.correctedSnippet?.trim();
+        if (cleanWord && cleanWord.length > 1 && !errorWordsMap.has(cleanWord.toLowerCase())) {
+          errorWordsMap.set(cleanWord.toLowerCase(), {
+            exampleRu: sent.referenceText,
+            exampleVi: lesson.titleVi,
+            sentenceNum: sent.order,
+          });
+        }
+      }
+    }
+
+    let addedCount = 0;
+    for (const [wordKey, info] of errorWordsMap.entries()) {
+      const vocabMatch = lesson.vocabulary.find(
+        (v) => v.word.toLowerCase() === wordKey || v.word.toLowerCase().includes(wordKey),
+      );
+
+      addCustomVocabulary({
+        word: vocabMatch?.word || wordKey,
+        stressedWord: vocabMatch?.stressedWord || vocabMatch?.word || wordKey,
+        partOfSpeech: vocabMatch?.partOfSpeech || 'существительное',
+        forms: vocabMatch?.forms || '',
+        meaningVi: vocabMatch?.meaningVi || `Từ vựng lỗi/chưa nghe được từ bài "${lesson.titleVi}"`,
+        definitionRu: vocabMatch?.definitionRu || '',
+        exampleRu: info.exampleRu,
+        exampleVi: info.exampleVi,
+        sourceLessonId: lesson.id,
+        sourceLessonTitle: lesson.titleVi,
+        notes: `Thêm tự động từ bài nghe chép (câu ${info.sentenceNum})`,
+      });
+      addedCount += 1;
+    }
+
+    if (addedCount > 0) {
+      setAddedMistakesNotice(`Đã thêm ${addedCount} từ vựng nghe sai/thiếu vào Sổ tay từ vựng thành công!`);
+    } else {
+      setAddedMistakesNotice('Không phát hiện từ vựng lỗi mới nào để thêm.');
+    }
   };
 
   const handleAiDeepExplain = async (sentenceId: string, referenceText: string, learnerText: string) => {
@@ -1190,22 +1185,25 @@ export const DictationWorkspacePage: React.FC = () => {
             {audioSource === 'offline_cache' &&
               'Nguồn âm thanh: Bản lưu ngoại tuyến trên thiết bị'}
             {audioSource === 'persisted_news_audio' &&
-              'Nguồn âm thanh: Audio tiếng Nga đã lưu & tách câu trên máy chủ'}
+              'Nguồn âm thanh: Audio tiếng Nga đã lưu trên máy chủ (0 lượt gọi API)'}
             {audioSource === 'server_multi_tts' &&
-              'Nguồn âm thanh: Gemini 3.8 Flash TTS · Hội thoại đa giọng theo giới tính'}
+              `Nguồn âm thanh: ${audioSourceMeta?.provider || capabilities.ttsProvider || 'gemini-3.8-flash-lite-tts'} · Hội thoại đa giọng${audioSourceMeta?.cached ? ' (từ bộ nhớ đệm)' : ''}`}
             {audioSource === 'server_tts' &&
-              'Nguồn âm thanh: Gemini 3.8 Flash TTS · Giọng hội thoại theo giới tính'}
-            {audioSource === 'browser_speech' && 'Nguồn âm thanh: Giọng đọc trình duyệt (ru-RU)'}
+              `Nguồn âm thanh: ${audioSourceMeta?.provider || capabilities.ttsProvider || 'gemini-3.8-flash-lite-tts'}${audioSourceMeta?.voiceId ? ` · Giọng ${audioSourceMeta.voiceId}` : ''}${audioSourceMeta?.cached ? ' (từ bộ nhớ đệm)' : ''}`}
+            {audioSource === 'browser_speech' &&
+              'Nguồn âm thanh: Giọng đọc trình duyệt cục bộ (ru-RU · Chế độ thủ công)'}
             {audioSource === 'timed_fallback' &&
-              'Chế độ mô phỏng thời lượng (thiết bị chưa có gói giọng ru-RU)'}
+              'Nguồn âm thanh: Mô phỏng thời lượng cục bộ (Trình duyệt chưa có giọng ru-RU)'}
             {!audioSource &&
               (isDownloadedOffline
                 ? 'Sẵn sàng phát ngoại tuyến trên thiết bị'
                 : currentSentence.audioUrl
                   ? 'Sẵn sàng phát file audio tách từng câu từ máy chủ'
-                  : capabilities.ttsAvailable && isOnline
-                    ? 'Sẵn sàng Gemini 3.8 Flash TTS (Đa giọng theo giới tính)'
-                    : 'Chế độ trình duyệt / Demo cục bộ')}
+                  : profile.ttsPreference === 'browser'
+                    ? 'Chế độ thủ công: Giọng đọc trình duyệt (ru-RU)'
+                    : capabilities.ttsAvailable && isOnline
+                      ? `Sẵn sàng ${capabilities.ttsProvider || 'gemini-3.8-flash-lite-tts'} (Free Tier · Đa giọng nam/nữ)`
+                      : 'Chế độ ngoại tuyến / Giọng đọc cục bộ')}
           </div>
         </div>
 
@@ -1225,7 +1223,7 @@ export const DictationWorkspacePage: React.FC = () => {
               >
                 <span className="font-semibold cyrillic-prose">{sp.name}</span>
                 <span aria-hidden="true"> · </span>
-                <span>{VOICE_PERSONA_LABELS_VI[sp.voiceName]}</span>
+                <span>{getVoicePersonaLabelVi(sp.voiceName)}</span>
               </div>
             );
           })}
@@ -1341,9 +1339,38 @@ export const DictationWorkspacePage: React.FC = () => {
         )}
 
         {audioError && (
-          <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-            {audioError}
-          </p>
+          <div
+            role="alert"
+            className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2.5"
+          >
+            <span className="leading-relaxed">{audioError}</span>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  setAudioError(null);
+                  void playSingleSentence(activeSentenceIdx, mode === 'full');
+                }}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] rounded-md bg-white border border-amber-300 text-amber-900 font-semibold hover:bg-amber-100"
+              >
+                <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>Thử tải lại giọng đọc</span>
+              </button>
+              {profile.ttsPreference === 'auto' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    updateProfile({ ttsPreference: 'browser' });
+                    setAudioError(null);
+                    void playSingleSentence(activeSentenceIdx, mode === 'full', false);
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] rounded-md bg-amber-900/10 border border-amber-300 text-amber-950 font-medium hover:bg-amber-200/70"
+                >
+                  <span>Dùng tạm giọng trình duyệt (ru-RU)</span>
+                </button>
+              )}
+            </div>
+          </div>
         )}
       </section>
 
@@ -1781,14 +1808,41 @@ export const DictationWorkspacePage: React.FC = () => {
                 </p>
               </div>
 
-              <button
-                type="button"
-                onClick={handleResetToDictation}
-                className="px-4 py-2 min-h-[44px] rounded-lg border border-slate-200 text-xs font-semibold text-[#0F2342] hover:bg-slate-50 whitespace-nowrap self-start"
-              >
-                Làm lại bài nghe chép
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleAddMistakesToVocabulary}
+                  className="inline-flex items-center gap-2 px-4 py-2 min-h-[44px] rounded-lg bg-[#1F7A6E] text-white text-xs font-semibold hover:bg-[#165B52] transition-colors whitespace-nowrap"
+                >
+                  <Plus className="w-4 h-4" aria-hidden="true" />
+                  <span>Thêm các từ nghe sai vào Sổ tay từ vựng</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleResetToDictation}
+                  className="px-4 py-2 min-h-[44px] rounded-lg border border-slate-200 text-xs font-semibold text-[#0F2342] hover:bg-slate-50 whitespace-nowrap"
+                >
+                  Làm lại bài nghe chép
+                </button>
+              </div>
             </div>
+
+            {addedMistakesNotice && (
+              <div
+                role="status"
+                className="mt-4 p-3 rounded-xl bg-[#F2F9F8] border border-[#1F7A6E]/30 text-xs text-[#165B52] flex items-center justify-between gap-3"
+              >
+                <span>{addedMistakesNotice}</span>
+                <button
+                  type="button"
+                  onClick={() => setAddedMistakesNotice(null)}
+                  className="font-semibold underline"
+                >
+                  Đóng
+                </button>
+              </div>
+            )}
 
             {!analysisReport.referenceAvailable ? (
               <p className="mt-4 text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-3">
@@ -2096,8 +2150,10 @@ export const DictationWorkspacePage: React.FC = () => {
                           onClick={() =>
                             void russianAudioEngine.playSentence({
                               text: item.word,
+                              speaker: getDefaultRussianNarratorSpeaker('female'),
                               speed: 1,
-                              preferServerTts: capabilities.ttsAvailable && isOnline,
+                              preferServerTts:
+                                profile.ttsPreference === 'auto' && capabilities.ttsAvailable && isOnline,
                               onError: (msg) => setAudioError(msg),
                             })
                           }

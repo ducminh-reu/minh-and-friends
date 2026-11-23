@@ -1,5 +1,33 @@
 import crypto from 'node:crypto';
-import type { CefrLevel } from '../src/types/domain.ts';
+import fs from 'node:fs';
+import path from 'node:path';
+import type {
+  CefrLevel,
+  GeminiVoiceId,
+  TtsModelId,
+  TtsProviderId,
+  VoiceAgeStyle,
+  VoiceConfigProfile,
+  VoiceSpeakingStyle,
+} from '../src/types/domain.ts';
+import { findSpeakerProfile } from '../src/utils/speakerUtils.ts';
+import {
+  DEFAULT_TTS_LOCALE,
+  DEFAULT_TTS_PROVIDER,
+  FEMALE_VOICE_IDS,
+  MALE_VOICE_IDS,
+  VOICE_CACHE_SCHEMA_VERSION,
+  assignDistinctSpeakerVoices,
+  buildRussianStylePrompt,
+  buildVoiceCacheSignature,
+  resolveVoiceProfile,
+} from '../src/utils/voiceRegistry.ts';
+import {
+  analyzeWavAcoustics,
+  concatenateWavSegmentsWithTurnPauses,
+  ensureWavBuffer,
+  type WavAcousticDiagnostics,
+} from '../src/utils/wavAudioUtils.ts';
 import {
   classifyGeminiError,
   computeBackoffDelayMs,
@@ -10,95 +38,76 @@ import {
 } from './geminiQuotaManager.ts';
 import { createGeminiTtsClient, isGeminiConfigured } from './geminiService.ts';
 
-export type GeminiVoiceName = 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr';
+export type GeminiVoiceName = GeminiVoiceId;
+export const FEMALE_VOICES: readonly GeminiVoiceId[] = FEMALE_VOICE_IDS;
+export const MALE_VOICES: readonly GeminiVoiceId[] = MALE_VOICE_IDS;
 
-export const FEMALE_VOICES: readonly GeminiVoiceName[] = ['Kore', 'Zephyr'];
-export const MALE_VOICES: readonly GeminiVoiceName[] = ['Puck', 'Charon', 'Fenrir'];
+/**
+ * Default to Free-Tier-optimized `gemini-3.8-flash-lite-tts` for lowest cost ($0 Free Tier),
+ * lowest latency, and highest quota headroom. Can be overridden to `gemini-3.8-flash-tts`
+ * via GEMINI_TTS_MODEL env var. Never uses paid-only models.
+ */
+export const CONFIGURED_TTS_MODEL: TtsModelId =
+  process.env.GEMINI_TTS_MODEL?.trim() === 'gemini-3.8-flash-tts'
+    ? 'gemini-3.8-flash-tts'
+    : 'gemini-3.8-flash-lite-tts';
 
-export const CONFIGURED_TTS_MODEL: 'gemini-3.8-flash-tts' | 'gemini-3.8-flash-lite-tts' =
-  process.env.GEMINI_TTS_MODEL?.trim() === 'gemini-3.8-flash-lite-tts'
-    ? 'gemini-3.8-flash-lite-tts'
-    : 'gemini-3.8-flash-tts';
+export const SECONDARY_FREE_TTS_MODEL: TtsModelId =
+  CONFIGURED_TTS_MODEL === 'gemini-3.8-flash-lite-tts'
+    ? 'gemini-3.8-flash-tts'
+    : 'gemini-3.8-flash-lite-tts';
 
 export const TTS_REQUEST_TIMEOUT_MS = 60_000;
 export const TTS_MAX_ATTEMPTS = 3;
 
-const VOICE_PERSONA_STYLE: Record<GeminiVoiceName, string> = {
-  Kore: 'Warm, expressive adult Russian woman speaking naturally in fluent standard Russian with authentic Moscow intonation, gentle conversational rhythm, and natural phrasing',
-  Zephyr:
-    'Bright, lively young Russian woman speaking in natural everyday Russian with authentic emotional inflection, smooth connected speech, and clear pronunciation',
-  Puck: 'Natural, friendly young adult Russian man speaking casually and expressively in everyday Russian with warm conversational pacing and relaxed intonation',
-  Charon:
-    'Calm, confident mature Russian man with a deeper baritone voice, speaking naturally and thoughtfully with authentic Russian cadence and subtle conversational pauses',
-  Fenrir:
-    'Grounded, articulate adult Russian man speaking in clear, natural conversational Russian with authentic stress rhythm and steady tone',
-};
+const DISK_CACHE_DIR = path.resolve(process.cwd(), '.data', 'tts-cache');
+const DISK_CACHE_STATS_FILE = path.join(DISK_CACHE_DIR, 'stats.json');
 
 export function resolveVoiceForGender(
   requestedVoice: string | undefined,
   gender: 'male' | 'female' | undefined,
-): GeminiVoiceName {
-  const validVoices: readonly GeminiVoiceName[] = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
-  const isKnown = validVoices.includes(requestedVoice as GeminiVoiceName);
-
-  if (gender === 'female') {
-    if (isKnown && FEMALE_VOICES.includes(requestedVoice as GeminiVoiceName)) {
-      return requestedVoice as GeminiVoiceName;
-    }
-    return 'Kore';
-  }
-
-  if (gender === 'male') {
-    if (isKnown && MALE_VOICES.includes(requestedVoice as GeminiVoiceName)) {
-      return requestedVoice as GeminiVoiceName;
-    }
-    return 'Puck';
-  }
-
-  return isKnown ? (requestedVoice as GeminiVoiceName) : 'Kore';
+): GeminiVoiceId {
+  return resolveVoiceProfile(requestedVoice, gender).voiceId;
 }
 
 export function buildConversationalStyle(input: {
-  voiceName: GeminiVoiceName;
+  voiceName: GeminiVoiceId;
   gender?: 'male' | 'female';
+  ageStyle?: VoiceAgeStyle;
+  speakingStyle?: VoiceSpeakingStyle;
+  speakingRate?: number;
+  emotion?: string;
   speakerRole?: string;
   topic?: string;
-  previousSpeaker?: string;
-  previousText?: string;
   customStyle?: string;
 }): string {
-  const basePersona = VOICE_PERSONA_STYLE[input.voiceName];
-  const parts: string[] = [basePersona];
-
-  if (input.speakerRole) {
-    parts.push(`Character role: ${input.speakerRole}.`);
-  }
-  if (input.topic) {
-    parts.push(`Conversation setting/topic: ${input.topic}.`);
-  }
-  if (input.previousText && input.previousSpeaker) {
-    parts.push(
-      `Replying naturally in an ongoing dialogue right after ${input.previousSpeaker} said: "${input.previousText.slice(0, 120)}".`,
-    );
-  } else {
-    parts.push('Speak like a real person in a live conversation, never like a robotic announcer.');
-  }
-  if (input.customStyle) {
-    parts.push(input.customStyle);
-  }
-
-  return parts.join(' ').slice(0, 480);
+  const profile = resolveVoiceProfile(input.voiceName, input.gender, {
+    ageStyle: input.ageStyle,
+    speakingStyle: input.speakingStyle,
+    speakingRate: input.speakingRate,
+    emotion: input.emotion,
+  });
+  return buildRussianStylePrompt(profile, {
+    speakerRole: input.speakerRole,
+    topic: input.topic,
+    customStyle: input.customStyle,
+  });
 }
 
 export interface TtsSynthesisRequest {
   text: string;
-  voiceName?: GeminiVoiceName;
+  voiceName?: GeminiVoiceId;
   gender?: 'male' | 'female';
+  ageStyle?: VoiceAgeStyle;
+  speakingStyle?: VoiceSpeakingStyle;
+  speakingRate?: number;
+  emotion?: string;
   speakerRole?: string;
   topic?: string;
   previousSpeaker?: string;
   previousText?: string;
   style?: string;
+  modelOverride?: TtsModelId;
   lessonId?: string;
   cefrLevel?: CefrLevel;
   forceRegenerate?: boolean;
@@ -112,8 +121,12 @@ export interface TtsDialogueTurn {
 
 export interface TtsDialogueSpeaker {
   speaker: string;
-  voiceName?: GeminiVoiceName;
+  voiceName?: GeminiVoiceId;
   gender: 'male' | 'female';
+  ageStyle?: VoiceAgeStyle;
+  speakingStyle?: VoiceSpeakingStyle;
+  speakingRate?: number;
+  emotion?: string;
   role?: string;
 }
 
@@ -121,6 +134,7 @@ export interface TtsDialogueRequest {
   speakers: TtsDialogueSpeaker[];
   turns: TtsDialogueTurn[];
   topic?: string;
+  modelOverride?: TtsModelId;
   lessonId?: string;
   cefrLevel?: CefrLevel;
   forceRegenerate?: boolean;
@@ -131,10 +145,35 @@ export interface TtsSynthesisResult {
   audioBase64: string;
   mimeType: 'audio/wav';
   cached: boolean;
-  provider: 'gemini-3.8-flash-tts' | 'gemini-3.8-flash-lite-tts';
-  voiceName?: GeminiVoiceName;
+  cacheLayer?: 'memory' | 'disk' | 'upstream';
+  provider: TtsModelId;
+  providerId?: TtsProviderId;
+  locale?: 'ru-RU';
+  voiceName?: GeminiVoiceId;
+  gender?: 'male' | 'female';
+  cacheKey?: string;
+  acoustics?: WavAcousticDiagnostics;
   retryCount?: number;
   queueWaitMs?: number;
+  turnTimings?: { startSec: number; endSec: number; durationSec: number }[];
+  turnWavsBase64?: string[];
+  turnCacheHits?: number;
+  turnUpstreamCalls?: number;
+}
+
+export interface TtsCacheStats {
+  provider: TtsProviderId;
+  primaryModel: TtsModelId;
+  secondaryModel: TtsModelId;
+  cacheSchemaVersion: string;
+  memoryEntries: number;
+  diskEntries: number;
+  diskBytes: number;
+  cacheHitsSaved: number;
+  memoryHits: number;
+  diskHits: number;
+  upstreamCallsSucceeded: number;
+  upstreamCallsFailed: number;
 }
 
 export interface TtsProvider {
@@ -158,32 +197,204 @@ export class TtsQuotaError extends Error {
   }
 }
 
-const MAX_CACHE_ENTRIES = 160;
-const audioCache = new Map<
-  string,
-  { audioBase64: string; provider: 'gemini-3.8-flash-tts' | 'gemini-3.8-flash-lite-tts' }
->();
+interface CacheEntry {
+  audioBase64: string;
+  provider: TtsModelId;
+  voiceName: GeminiVoiceId;
+  gender: 'male' | 'female';
+  acoustics?: WavAcousticDiagnostics;
+}
+
+interface PersistentCacheStatsFile {
+  cacheHitsSaved: number;
+  memoryHits: number;
+  diskHits: number;
+  upstreamCallsSucceeded: number;
+  upstreamCallsFailed: number;
+}
+
+const MAX_MEMORY_CACHE_ENTRIES = 220;
+const audioMemoryCache = new Map<string, CacheEntry>();
+
+let cacheStatsState: PersistentCacheStatsFile = {
+  cacheHitsSaved: 0,
+  memoryHits: 0,
+  diskHits: 0,
+  upstreamCallsSucceeded: 0,
+  upstreamCallsFailed: 0,
+};
+let statsLoaded = false;
+
+function ensureDiskCacheDir(): void {
+  try {
+    fs.mkdirSync(DISK_CACHE_DIR, { recursive: true });
+  } catch {
+    // Ignore if filesystem is read-only
+  }
+}
+
+function loadPersistentStatsOnce(): void {
+  if (statsLoaded) return;
+  statsLoaded = true;
+  try {
+    if (fs.existsSync(DISK_CACHE_STATS_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(DISK_CACHE_STATS_FILE, 'utf8')) as Partial<PersistentCacheStatsFile>;
+      cacheStatsState = {
+        cacheHitsSaved: Number(parsed.cacheHitsSaved) || 0,
+        memoryHits: Number(parsed.memoryHits) || 0,
+        diskHits: Number(parsed.diskHits) || 0,
+        upstreamCallsSucceeded: Number(parsed.upstreamCallsSucceeded) || 0,
+        upstreamCallsFailed: Number(parsed.upstreamCallsFailed) || 0,
+      };
+    }
+  } catch {
+    // Start fresh if corrupted
+  }
+}
+
+function persistStatsSafe(): void {
+  try {
+    ensureDiskCacheDir();
+    const tmp = `${DISK_CACHE_STATS_FILE}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(cacheStatsState, null, 2), 'utf8');
+    fs.renameSync(tmp, DISK_CACHE_STATS_FILE);
+  } catch {
+    // Non-fatal
+  }
+}
+
+function recordCacheHit(layer: 'memory' | 'disk'): void {
+  loadPersistentStatsOnce();
+  cacheStatsState.cacheHitsSaved += 1;
+  if (layer === 'memory') cacheStatsState.memoryHits += 1;
+  else cacheStatsState.diskHits += 1;
+  persistStatsSafe();
+}
+
+function recordUpstreamCall(ok: boolean): void {
+  loadPersistentStatsOnce();
+  if (ok) cacheStatsState.upstreamCallsSucceeded += 1;
+  else cacheStatsState.upstreamCallsFailed += 1;
+  persistStatsSafe();
+}
 
 function stripCombiningAcute(str: string): string {
   return str.normalize('NFC').replace(/\u0301/g, '').trim();
 }
 
-function makeCacheKey(raw: string): string {
+function hashCacheKey(raw: string): string {
   return crypto.createHash('sha256').update(raw).digest('hex');
 }
 
-function setBoundedCache(
-  key: string,
-  value: { audioBase64: string; provider: 'gemini-3.8-flash-tts' | 'gemini-3.8-flash-lite-tts' },
-): void {
-  if (!value.audioBase64 || value.audioBase64.length < 64) {
+function setMemoryCache(key: string, entry: CacheEntry): void {
+  if (!entry.audioBase64 || entry.audioBase64.length < 64) return;
+  if (audioMemoryCache.size >= MAX_MEMORY_CACHE_ENTRIES) {
+    const oldestKey = audioMemoryCache.keys().next().value;
+    if (oldestKey) audioMemoryCache.delete(oldestKey);
+  }
+  audioMemoryCache.set(key, entry);
+}
+
+function getDiskCachePaths(hashKey: string): { wavPath: string; metaPath: string } {
+  const safe = /^[a-f0-9]{64}$/.test(hashKey) ? hashKey : hashCacheKey(hashKey);
+  return {
+    wavPath: path.join(DISK_CACHE_DIR, `${safe}.wav`),
+    metaPath: path.join(DISK_CACHE_DIR, `${safe}.json`),
+  };
+}
+
+function readDiskCacheEntry(hashKey: string): CacheEntry | null {
+  try {
+    const { wavPath, metaPath } = getDiskCachePaths(hashKey);
+    if (!fs.existsSync(wavPath)) return null;
+    const wavBuf = fs.readFileSync(wavPath);
+    const acoustics = analyzeWavAcoustics(wavBuf);
+    if (!acoustics.valid) {
+      return null;
+    }
+    let meta: Partial<CacheEntry> = {};
+    if (fs.existsSync(metaPath)) {
+      meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')) as Partial<CacheEntry>;
+    }
+    const entry: CacheEntry = {
+      audioBase64: wavBuf.toString('base64'),
+      provider: (meta.provider as TtsModelId) ?? CONFIGURED_TTS_MODEL,
+      voiceName: (meta.voiceName as GeminiVoiceId) ?? 'Sulafat',
+      gender: meta.gender === 'male' ? 'male' : 'female',
+      acoustics,
+    };
+    setMemoryCache(hashKey, entry);
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+function writeDiskCacheEntry(hashKey: string, wavBuf: Buffer, entry: CacheEntry): void {
+  const acoustics = analyzeWavAcoustics(wavBuf);
+  if (!acoustics.valid) {
+    // NEVER write empty, silent, or invalid audio to disk cache
     return;
   }
-  if (audioCache.size >= MAX_CACHE_ENTRIES) {
-    const oldestKey = audioCache.keys().next().value;
-    if (oldestKey) audioCache.delete(oldestKey);
+  try {
+    ensureDiskCacheDir();
+    const { wavPath, metaPath } = getDiskCachePaths(hashKey);
+    const tmpWav = `${wavPath}.tmp-${process.pid}-${crypto.randomBytes(3).toString('hex')}`;
+    const tmpMeta = `${metaPath}.tmp-${process.pid}-${crypto.randomBytes(3).toString('hex')}`;
+    fs.writeFileSync(tmpWav, wavBuf);
+    fs.renameSync(tmpWav, wavPath);
+    fs.writeFileSync(
+      tmpMeta,
+      JSON.stringify({
+        provider: entry.provider,
+        voiceName: entry.voiceName,
+        gender: entry.gender,
+        acoustics,
+        cachedAt: new Date().toISOString(),
+      }),
+      'utf8',
+    );
+    fs.renameSync(tmpMeta, metaPath);
+  } catch {
+    // Non-fatal if disk write fails
   }
-  audioCache.set(key, value);
+}
+
+export function getTtsCacheStats(): TtsCacheStats {
+  loadPersistentStatsOnce();
+  let diskEntries = 0;
+  let diskBytes = 0;
+  try {
+    if (fs.existsSync(DISK_CACHE_DIR)) {
+      for (const file of fs.readdirSync(DISK_CACHE_DIR)) {
+        if (file.endsWith('.wav')) {
+          diskEntries += 1;
+          diskBytes += fs.statSync(path.join(DISK_CACHE_DIR, file)).size;
+        }
+      }
+    }
+  } catch {
+    // Ignore
+  }
+
+  return {
+    provider: DEFAULT_TTS_PROVIDER,
+    primaryModel: CONFIGURED_TTS_MODEL,
+    secondaryModel: SECONDARY_FREE_TTS_MODEL,
+    cacheSchemaVersion: VOICE_CACHE_SCHEMA_VERSION,
+    memoryEntries: audioMemoryCache.size,
+    diskEntries,
+    diskBytes,
+    cacheHitsSaved: cacheStatsState.cacheHitsSaved,
+    memoryHits: cacheStatsState.memoryHits,
+    diskHits: cacheStatsState.diskHits,
+    upstreamCallsSucceeded: cacheStatsState.upstreamCallsSucceeded,
+    upstreamCallsFailed: cacheStatsState.upstreamCallsFailed,
+  };
+}
+
+export function clearMemoryTtsCacheForTest(): void {
+  audioMemoryCache.clear();
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -215,8 +426,11 @@ export async function executeTtsWithSmartRetry<T>(options: {
     } catch (err) {
       clearTimeout(timer);
       const effectiveErr =
-        controller.signal.aborted && !(err instanceof Error && err.message.toLowerCase().includes('timed out'))
-          ? new Error(`TTS audio synthesis timed out after ${Math.round(timeoutMs / 1000)}s (model: ${options.model}).`)
+        controller.signal.aborted &&
+        !(err instanceof Error && err.message.toLowerCase().includes('timed out'))
+          ? new Error(
+              `TTS audio synthesis timed out after ${Math.round(timeoutMs / 1000)}s (model: ${options.model}).`,
+            )
           : err;
 
       const classified = classifyGeminiError(effectiveErr);
@@ -243,11 +457,84 @@ export async function executeTtsWithSmartRetry<T>(options: {
     }
   }
 
-  throw new TtsQuotaError(classifyGeminiError(new Error('TTS failed after max attempts.')), retriesPerformed);
+  throw new TtsQuotaError(
+    classifyGeminiError(new Error('TTS failed after max attempts.')),
+    retriesPerformed,
+  );
+}
+
+/**
+ * Invokes Gemini TTS with `languageCode: 'ru-RU'` and exact gender-locked voiceId.
+ * If the API specifically rejects `languageCode` with HTTP 400 INVALID_ARGUMENT,
+ * retries once without `languageCode` while keeping the EXACT same voiceId and gender.
+ */
+async function callGeminiSingleTts(options: {
+  model: TtsModelId;
+  text: string;
+  style: string;
+  voiceProfile: VoiceConfigProfile;
+  signal: AbortSignal;
+}): Promise<Buffer> {
+  const ai = createGeminiTtsClient(TTS_REQUEST_TIMEOUT_MS);
+
+  const invokeWithLanguageCode = async (includeLangCode: boolean): Promise<Buffer> => {
+    const response = await ai.models.generateContent({
+      model: options.model,
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: options.text,
+              speechMetadata: { style: options.style },
+            },
+          ],
+        },
+      ],
+      config: {
+        responseModalities: ['AUDIO'],
+        abortSignal: options.signal,
+        httpOptions: { timeout: TTS_REQUEST_TIMEOUT_MS },
+        speechConfig: {
+          ...(includeLangCode ? { languageCode: options.voiceProfile.locale } : {}),
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: options.voiceProfile.voiceId },
+          },
+        },
+      },
+    });
+
+    const data = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (!data || data.length < 64) {
+      throw new Error('TTS provider returned empty audio data.');
+    }
+    const wavBuf = ensureWavBuffer(Buffer.from(data, 'base64'), 24000);
+    const acoustics = analyzeWavAcoustics(wavBuf);
+    if (!acoustics.valid) {
+      throw new Error(
+        `TTS provider returned invalid or silent audio (bytes=${acoustics.bytes}, duration=${acoustics.durationSec}s, rms=${acoustics.rms}).`,
+      );
+    }
+    return wavBuf;
+  };
+
+  try {
+    return await invokeWithLanguageCode(true);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const classified = classifyGeminiError(err);
+    if (
+      classified.category === 'invalid_request' &&
+      /language_?code|speech_?config/i.test(msg)
+    ) {
+      return await invokeWithLanguageCode(false);
+    }
+    throw err;
+  }
 }
 
 export class GeminiRussianTtsProvider implements TtsProvider {
-  readonly name: 'gemini-3.8-flash-tts' | 'gemini-3.8-flash-lite-tts' = CONFIGURED_TTS_MODEL;
+  readonly name: TtsModelId = CONFIGURED_TTS_MODEL;
   private readonly queue: TtsRequestQueue;
 
   constructor(queue: TtsRequestQueue = globalTtsQueue) {
@@ -258,82 +545,183 @@ export class GeminiRussianTtsProvider implements TtsProvider {
     return isGeminiConfigured();
   }
 
+  private resolveActiveModel(requestedModel?: TtsModelId): TtsModelId {
+    const primary: TtsModelId = requestedModel ?? this.name;
+    // If primary model is currently blocked by daily quota, automatically check if the other
+    // Free-Tier Gemini TTS model is NOT blocked — strictly $0 Free Tier, never paid models.
+    if (
+      !requestedModel &&
+      this.queue.isDailyQuotaBlocked(primary) &&
+      !this.queue.isDailyQuotaBlocked(SECONDARY_FREE_TTS_MODEL)
+    ) {
+      return SECONDARY_FREE_TTS_MODEL;
+    }
+    return primary;
+  }
+
   async synthesize(req: TtsSynthesisRequest): Promise<TtsSynthesisResult> {
     const cleanText = stripCombiningAcute(req.text);
     if (!cleanText) {
       throw new Error('Empty text cannot be synthesized.');
     }
 
-    const voiceName = resolveVoiceForGender(req.voiceName, req.gender);
-    const style = buildConversationalStyle({
-      voiceName,
-      gender: req.gender,
+    const activeModel = this.resolveActiveModel(req.modelOverride);
+    const voiceProfile = resolveVoiceProfile(req.voiceName, req.gender, {
+      model: activeModel,
+      ageStyle: req.ageStyle,
+      speakingStyle: req.speakingStyle,
+      speakingRate: req.speakingRate,
+      emotion: req.emotion,
+    });
+
+    const style = buildRussianStylePrompt(voiceProfile, {
       speakerRole: req.speakerRole,
       topic: req.topic,
-      previousSpeaker: req.previousSpeaker ? stripCombiningAcute(req.previousSpeaker) : undefined,
-      previousText: req.previousText ? stripCombiningAcute(req.previousText) : undefined,
       customStyle: req.style,
     });
 
-    const cacheKey = makeCacheKey(`single::v3::${this.name}::${voiceName}::${style}::${cleanText}`);
+    const buildKeyForModel = (modelId: TtsModelId): string =>
+      hashCacheKey(
+        buildVoiceCacheSignature({
+          text: cleanText,
+          provider: DEFAULT_TTS_PROVIDER,
+          model: modelId,
+          voiceId: voiceProfile.voiceId,
+          locale: DEFAULT_TTS_LOCALE,
+          gender: voiceProfile.gender,
+          ageStyle: voiceProfile.ageStyle,
+          speakingStyle: voiceProfile.speakingStyle,
+          speakingRate: voiceProfile.speakingRate,
+          pitch: voiceProfile.pitch,
+          emotion: voiceProfile.emotion,
+          stylePrompt: style,
+        }),
+      );
+
+    const cacheKey = buildKeyForModel(activeModel);
+
+    // 1. Check in-memory cache first, then persistent disk cache (0 API calls!)
+    // When no explicit modelOverride is specified, check both Free-Tier models so quota rollover
+    // never misses a valid cached WAV already generated by the other Free-Tier model.
     if (!req.forceRegenerate) {
-      const hit = audioCache.get(cacheKey);
-      if (hit) {
-        recordGeminiMonitoringEvent({
-          requestType: 'tts_single',
-          model: hit.provider,
-          lessonId: req.lessonId ?? null,
-          cefrLevel: req.cefrLevel ?? null,
-          httpStatus: 200,
-          errorCategory: 'none',
-          retryCount: 0,
-          queueWaitMs: 0,
-          processingDurationMs: 0,
-          reusedFromCache: true,
-          outcome: 'completed',
-          retryAfterMs: null,
-          quotaId: null,
-        });
-        return {
-          audioBase64: hit.audioBase64,
-          mimeType: 'audio/wav',
-          cached: true,
-          provider: hit.provider,
-          voiceName,
-          retryCount: 0,
-          queueWaitMs: 0,
-        };
+      const candidateModels: TtsModelId[] = req.modelOverride
+        ? [activeModel]
+        : Array.from(new Set<TtsModelId>([activeModel, this.name, SECONDARY_FREE_TTS_MODEL]));
+
+      for (const candidateModel of candidateModels) {
+        const candidateKey = buildKeyForModel(candidateModel);
+        const memHit = audioMemoryCache.get(candidateKey);
+        if (memHit) {
+          recordCacheHit('memory');
+          recordGeminiMonitoringEvent({
+            requestType: 'tts_single',
+            model: memHit.provider,
+            lessonId: req.lessonId ?? null,
+            cefrLevel: req.cefrLevel ?? null,
+            httpStatus: 200,
+            errorCategory: 'none',
+            retryCount: 0,
+            queueWaitMs: 0,
+            processingDurationMs: 0,
+            reusedFromCache: true,
+            outcome: 'completed',
+            retryAfterMs: null,
+            quotaId: null,
+          });
+          return {
+            audioBase64: memHit.audioBase64,
+            mimeType: 'audio/wav',
+            cached: true,
+            cacheLayer: 'memory',
+            provider: memHit.provider,
+            providerId: DEFAULT_TTS_PROVIDER,
+            locale: DEFAULT_TTS_LOCALE,
+            voiceName: memHit.voiceName,
+            gender: memHit.gender,
+            cacheKey: candidateKey,
+            acoustics: memHit.acoustics,
+            retryCount: 0,
+            queueWaitMs: 0,
+          };
+        }
+      }
+
+      for (const candidateModel of candidateModels) {
+        const candidateKey = buildKeyForModel(candidateModel);
+        const diskHit = readDiskCacheEntry(candidateKey);
+        if (diskHit) {
+          recordCacheHit('disk');
+          recordGeminiMonitoringEvent({
+            requestType: 'tts_single',
+            model: diskHit.provider,
+            lessonId: req.lessonId ?? null,
+            cefrLevel: req.cefrLevel ?? null,
+            httpStatus: 200,
+            errorCategory: 'none',
+            retryCount: 0,
+            queueWaitMs: 0,
+            processingDurationMs: 0,
+            reusedFromCache: true,
+            outcome: 'completed',
+            retryAfterMs: null,
+            quotaId: null,
+          });
+          return {
+            audioBase64: diskHit.audioBase64,
+            mimeType: 'audio/wav',
+            cached: true,
+            cacheLayer: 'disk',
+            provider: diskHit.provider,
+            providerId: DEFAULT_TTS_PROVIDER,
+            locale: DEFAULT_TTS_LOCALE,
+            voiceName: diskHit.voiceName,
+            gender: diskHit.gender,
+            cacheKey: candidateKey,
+            acoustics: diskHit.acoustics,
+            retryCount: 0,
+            queueWaitMs: 0,
+          };
+        }
       }
     }
 
-    if (this.queue.isDailyQuotaBlocked() && !req.bypassDailyCooldown) {
+    // 2. Fail fast if daily quota is exhausted for this model (0 wasted API calls!)
+    if (this.queue.isDailyQuotaBlocked(activeModel) && !req.bypassDailyCooldown) {
       const classified = classifyGeminiError(
-        new Error('429 RESOURCE_EXHAUSTED: Daily quota previously exhausted for Gemini TTS.'),
+        new Error(
+          `429 RESOURCE_EXHAUSTED: Daily quota previously exhausted for Free Tier Gemini TTS (${activeModel}).`,
+        ),
       );
       throw new TtsQuotaError(classified, 0);
     }
 
-    const idempotencyKey = req.lessonId
-      ? `tts_single::${req.lessonId}::${cacheKey}`
-      : `tts_single::${cacheKey}`;
+    const idempotencyKey = `tts_single::${cacheKey}`;
 
     return this.queue.enqueue<TtsSynthesisResult>({
       idempotencyKey,
       lessonId: req.lessonId ?? null,
       cefrLevel: req.cefrLevel ?? null,
-      model: this.name,
+      model: activeModel,
       requestType: 'tts_single',
       task: async ({ queueWaitMs }) => {
+        // Double-check cache after queue wait in case an earlier queued job already generated it
         if (!req.forceRegenerate) {
-          const cachedAfterWait = audioCache.get(cacheKey);
+          const cachedAfterWait = audioMemoryCache.get(cacheKey) ?? readDiskCacheEntry(cacheKey);
           if (cachedAfterWait) {
+            recordCacheHit('memory');
             return {
               result: {
                 audioBase64: cachedAfterWait.audioBase64,
                 mimeType: 'audio/wav',
                 cached: true,
+                cacheLayer: 'memory',
                 provider: cachedAfterWait.provider,
-                voiceName,
+                providerId: DEFAULT_TTS_PROVIDER,
+                locale: DEFAULT_TTS_LOCALE,
+                voiceName: cachedAfterWait.voiceName,
+                gender: cachedAfterWait.gender,
+                cacheKey,
+                acoustics: cachedAfterWait.acoustics,
                 retryCount: 0,
                 queueWaitMs,
               },
@@ -345,69 +733,148 @@ export class GeminiRussianTtsProvider implements TtsProvider {
           }
         }
 
-        const { value: base64Audio, retryCount } = await executeTtsWithSmartRetry({
-          model: this.name,
-          timeoutMs: TTS_REQUEST_TIMEOUT_MS,
-          maxAttempts: TTS_MAX_ATTEMPTS,
-          onRateLimit: (delayMs) => this.queue.noteRateLimitCooldown(delayMs),
-          invoke: async (signal) => {
-            const ai = createGeminiTtsClient(TTS_REQUEST_TIMEOUT_MS);
-            const response = await ai.models.generateContent({
-              model: this.name,
-              contents: [
-                {
-                  role: 'user',
-                  parts: [
-                    {
-                      text: cleanText,
-                      speechMetadata: { style },
-                    },
-                  ],
-                },
-              ],
-              config: {
-                responseModalities: ['AUDIO'],
-                abortSignal: signal,
-                httpOptions: { timeout: TTS_REQUEST_TIMEOUT_MS },
-                speechConfig: {
-                  voiceConfig: {
-                    prebuiltVoiceConfig: { voiceName },
-                  },
-                },
-              },
+        let usedModel: TtsModelId = activeModel;
+        let wavBuf: Buffer;
+        let retryCount = 0;
+
+        try {
+          const res = await executeTtsWithSmartRetry({
+            model: usedModel,
+            timeoutMs: TTS_REQUEST_TIMEOUT_MS,
+            maxAttempts: TTS_MAX_ATTEMPTS,
+            onRateLimit: (delayMs) => this.queue.noteRateLimitCooldown(delayMs),
+            invoke: async (signal) =>
+              callGeminiSingleTts({
+                model: usedModel,
+                text: cleanText,
+                style,
+                voiceProfile,
+                signal,
+              }),
+          });
+          wavBuf = res.value;
+          retryCount = res.retryCount;
+        } catch (err) {
+          const classified = err instanceof TtsQuotaError ? err.classified : classifyGeminiError(err);
+
+          // If primary Free-Tier model hit daily quota or 404 AND secondary Free-Tier model is available
+          // and not blocked, try the secondary Free-Tier model ONCE with the EXACT SAME gender-locked voiceId!
+          const canTrySecondaryFreeModel =
+            !req.modelOverride &&
+            (classified.category === 'daily_quota_exhausted' ||
+              classified.category === 'model_not_found') &&
+            usedModel !== SECONDARY_FREE_TTS_MODEL &&
+            !this.queue.isDailyQuotaBlocked(SECONDARY_FREE_TTS_MODEL);
+
+          if (classified.category === 'daily_quota_exhausted') {
+            this.queue.noteDailyQuotaExhausted(usedModel, classified.retryAfterMs);
+          }
+
+          if (!canTrySecondaryFreeModel) {
+            recordUpstreamCall(false);
+            throw err;
+          }
+
+          usedModel = SECONDARY_FREE_TTS_MODEL;
+          try {
+            const fallbackProfile = resolveVoiceProfile(voiceProfile.voiceId, voiceProfile.gender, {
+              model: usedModel,
+              ageStyle: voiceProfile.ageStyle,
+              speakingStyle: voiceProfile.speakingStyle,
+              speakingRate: voiceProfile.speakingRate,
+              emotion: voiceProfile.emotion,
             });
+            const res2 = await executeTtsWithSmartRetry({
+              model: usedModel,
+              timeoutMs: TTS_REQUEST_TIMEOUT_MS,
+              maxAttempts: 2,
+              onRateLimit: (delayMs) => this.queue.noteRateLimitCooldown(delayMs),
+              invoke: async (signal) =>
+                callGeminiSingleTts({
+                  model: usedModel,
+                  text: cleanText,
+                  style,
+                  voiceProfile: fallbackProfile,
+                  signal,
+                }),
+            });
+            wavBuf = res2.value;
+            retryCount += res2.retryCount;
+          } catch (err2) {
+            recordUpstreamCall(false);
+            throw err2;
+          }
+        }
 
-            const data = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-            if (!data || data.length < 64) {
-              throw new Error('TTS provider returned empty audio data.');
-            }
-            return data;
-          },
+        recordUpstreamCall(true);
+        const acoustics = analyzeWavAcoustics(wavBuf);
+        const audioBase64 = wavBuf.toString('base64');
+
+        // Compute cache key for the ACTUAL model that produced the audio (prevent cross-model cache pollution)
+        const actualSignature = buildVoiceCacheSignature({
+          text: cleanText,
+          provider: DEFAULT_TTS_PROVIDER,
+          model: usedModel,
+          voiceId: voiceProfile.voiceId,
+          locale: DEFAULT_TTS_LOCALE,
+          gender: voiceProfile.gender,
+          ageStyle: voiceProfile.ageStyle,
+          speakingStyle: voiceProfile.speakingStyle,
+          speakingRate: voiceProfile.speakingRate,
+          pitch: voiceProfile.pitch,
+          emotion: voiceProfile.emotion,
+          stylePrompt: style,
         });
+        const actualCacheKey = hashCacheKey(actualSignature);
+        const entry: CacheEntry = {
+          audioBase64,
+          provider: usedModel,
+          voiceName: voiceProfile.voiceId,
+          gender: voiceProfile.gender,
+          acoustics,
+        };
+        setMemoryCache(actualCacheKey, entry);
+        writeDiskCacheEntry(actualCacheKey, wavBuf, entry);
 
-        setBoundedCache(cacheKey, { audioBase64: base64Audio, provider: this.name });
         return {
           result: {
-            audioBase64: base64Audio,
+            audioBase64,
             mimeType: 'audio/wav',
             cached: false,
-            provider: this.name,
-            voiceName,
+            cacheLayer: 'upstream',
+            provider: usedModel,
+            providerId: DEFAULT_TTS_PROVIDER,
+            locale: DEFAULT_TTS_LOCALE,
+            voiceName: voiceProfile.voiceId,
+            gender: voiceProfile.gender,
+            cacheKey: actualCacheKey,
+            acoustics,
             retryCount,
             queueWaitMs,
           },
           reusedFromCache: false,
           retryCount,
           httpStatus: 200,
-          model: this.name,
+          model: usedModel,
         };
       },
     });
   }
 
+  /**
+   * Multi-speaker dialogue synthesis supporting 1, 2, 3, or N speakers!
+   * Uses strict per-turn synthesis with distinct gender-locked VoiceConfigProfiles +
+   * sample-accurate WAV stitching with natural speaker-switch pauses (360ms / 210ms).
+   *
+   * Benefits for Free Tier & Audio Quality:
+   * - Supports 2, 3, or more speakers with zero voice collision and zero gender drift.
+   * - Reuses persistent per-sentence disk cache for EVERY turn (playing full dialogue
+   *   then replaying individual sentences costs 0 extra TTS calls!).
+   * - Produces exact sample-accurate timings and individual turn WAVs (never chops mid-word!).
+   */
   async synthesizeDialogue(req: TtsDialogueRequest): Promise<TtsSynthesisResult> {
-    if (req.speakers.length !== 2) {
-      throw new Error('Multi-speaker dialogue synthesis requires exactly 2 speakers.');
+    if (!Array.isArray(req.speakers) || req.speakers.length === 0) {
+      throw new Error('Dialogue synthesis requires at least 1 speaker.');
     }
 
     const cleanTurns = req.turns
@@ -421,183 +888,83 @@ export class GeminiRussianTtsProvider implements TtsProvider {
       throw new Error('Dialogue turns cannot be empty.');
     }
 
-    const usedVoices = new Set<GeminiVoiceName>();
-    const speakerConfigs = req.speakers.map((sp) => {
-      const cleanName = stripCombiningAcute(sp.speaker);
-      let voiceName = resolveVoiceForGender(sp.voiceName, sp.gender);
-      if (usedVoices.has(voiceName)) {
-        const pool = sp.gender === 'female' ? FEMALE_VOICES : MALE_VOICES;
-        const alt = pool.find((v) => !usedVoices.has(v));
-        if (alt) voiceName = alt;
-      }
-      usedVoices.add(voiceName);
-
-      return {
-        speaker: cleanName,
-        gender: sp.gender,
-        role: sp.role,
-        voiceName,
-      };
-    });
-
-    const speakerMap = new Map(speakerConfigs.map((s) => [s.speaker, s]));
-
-    const serializedKey = JSON.stringify({
-      v: 3,
-      model: this.name,
-      topic: req.topic,
-      speakers: speakerConfigs,
-      turns: cleanTurns,
-    });
-    const cacheKey = makeCacheKey(`dialogue::${serializedKey}`);
-
-    if (!req.forceRegenerate) {
-      const hit = audioCache.get(cacheKey);
-      if (hit) {
-        recordGeminiMonitoringEvent({
-          requestType: 'tts_dialogue',
-          model: hit.provider,
-          lessonId: req.lessonId ?? null,
-          cefrLevel: req.cefrLevel ?? null,
-          httpStatus: 200,
-          errorCategory: 'none',
-          retryCount: 0,
-          queueWaitMs: 0,
-          processingDurationMs: 0,
-          reusedFromCache: true,
-          outcome: 'completed',
-          retryAfterMs: null,
-          quotaId: null,
-        });
-        return {
-          audioBase64: hit.audioBase64,
-          mimeType: 'audio/wav',
-          cached: true,
-          provider: hit.provider,
-          retryCount: 0,
-          queueWaitMs: 0,
-        };
-      }
-    }
-
-    if (this.queue.isDailyQuotaBlocked() && !req.bypassDailyCooldown) {
-      const classified = classifyGeminiError(
-        new Error('429 RESOURCE_EXHAUSTED: Daily quota previously exhausted for Gemini TTS.'),
-      );
-      throw new TtsQuotaError(classified, 0);
-    }
-
-    const parts = cleanTurns.map((turn) => {
-      const sp = speakerMap.get(turn.speaker) ?? speakerConfigs[0];
-      const style = buildConversationalStyle({
+    const assignedSpeakers = assignDistinctSpeakerVoices(
+      req.speakers.map((sp) => ({
+        name: stripCombiningAcute(sp.speaker),
+        roleVi: sp.role ?? '',
+        roleEn: sp.role ?? '',
         voiceName: sp.voiceName,
         gender: sp.gender,
-        speakerRole: sp.role,
+        ageStyle: sp.ageStyle,
+        speakingStyle: sp.speakingStyle ?? 'conversational',
+        speakingRate: sp.speakingRate,
+        emotion: sp.emotion,
+      })),
+    );
+
+    const turnWavs: { speaker: string; wav: Buffer }[] = [];
+    const turnWavsBase64: string[] = [];
+    let turnCacheHits = 0;
+    let turnUpstreamCalls = 0;
+    let totalRetries = 0;
+    let totalQueueWaitMs = 0;
+    let lastProvider: TtsModelId = req.modelOverride ?? this.name;
+
+    for (let i = 0; i < cleanTurns.length; i += 1) {
+      const turn = cleanTurns[i];
+      const matchedSpeaker =
+        findSpeakerProfile(assignedSpeakers, turn.speaker) ?? assignedSpeakers[0];
+
+      const singleRes = await this.synthesize({
+        text: turn.text,
+        voiceName: matchedSpeaker.voiceName,
+        gender: matchedSpeaker.gender,
+        ageStyle: matchedSpeaker.ageStyle,
+        speakingStyle: matchedSpeaker.speakingStyle ?? 'conversational',
+        speakingRate: matchedSpeaker.speakingRate,
+        emotion: matchedSpeaker.emotion,
+        speakerRole: matchedSpeaker.roleEn || matchedSpeaker.roleVi || undefined,
         topic: req.topic,
+        modelOverride: req.modelOverride,
+        lessonId: req.lessonId ? `${req.lessonId}-t${i + 1}` : undefined,
+        cefrLevel: req.cefrLevel,
+        forceRegenerate: req.forceRegenerate,
+        bypassDailyCooldown: req.bypassDailyCooldown,
       });
-      return {
-        text: `${sp.speaker}: ${turn.text}`,
-        speechMetadata: {
-          speaker: sp.speaker,
-          style,
-        },
-      };
+
+      if (singleRes.cached) turnCacheHits += 1;
+      else turnUpstreamCalls += 1;
+      totalRetries += singleRes.retryCount ?? 0;
+      totalQueueWaitMs += singleRes.queueWaitMs ?? 0;
+      lastProvider = singleRes.provider;
+
+      const wavBuf = ensureWavBuffer(Buffer.from(singleRes.audioBase64, 'base64'), 24000);
+      turnWavs.push({ speaker: matchedSpeaker.name, wav: wavBuf });
+      turnWavsBase64.push(wavBuf.toString('base64'));
+    }
+
+    const stitched = concatenateWavSegmentsWithTurnPauses(turnWavs, {
+      sameSpeakerPauseMs: 210,
+      speakerSwitchPauseMs: 360,
     });
+    const acoustics = analyzeWavAcoustics(stitched.fullWav);
 
-    const idempotencyKey = req.lessonId
-      ? `tts_dialogue::${req.lessonId}::${cacheKey}`
-      : `tts_dialogue::${cacheKey}`;
-
-    return this.queue.enqueue<TtsSynthesisResult>({
-      idempotencyKey,
-      lessonId: req.lessonId ?? null,
-      cefrLevel: req.cefrLevel ?? null,
-      model: this.name,
-      requestType: 'tts_dialogue',
-      task: async ({ queueWaitMs }) => {
-        if (!req.forceRegenerate) {
-          const cachedAfterWait = audioCache.get(cacheKey);
-          if (cachedAfterWait) {
-            return {
-              result: {
-                audioBase64: cachedAfterWait.audioBase64,
-                mimeType: 'audio/wav',
-                cached: true,
-                provider: cachedAfterWait.provider,
-                retryCount: 0,
-                queueWaitMs,
-              },
-              reusedFromCache: true,
-              retryCount: 0,
-              httpStatus: 200,
-              model: cachedAfterWait.provider,
-            };
-          }
-        }
-
-        const { value: base64Audio, retryCount } = await executeTtsWithSmartRetry({
-          model: this.name,
-          timeoutMs: TTS_REQUEST_TIMEOUT_MS,
-          maxAttempts: TTS_MAX_ATTEMPTS,
-          onRateLimit: (delayMs) => this.queue.noteRateLimitCooldown(delayMs),
-          invoke: async (signal) => {
-            const ai = createGeminiTtsClient(TTS_REQUEST_TIMEOUT_MS);
-            const response = await ai.models.generateContent({
-              model: this.name,
-              contents: [
-                {
-                  role: 'user',
-                  parts,
-                },
-              ],
-              config: {
-                responseModalities: ['AUDIO'],
-                abortSignal: signal,
-                httpOptions: { timeout: TTS_REQUEST_TIMEOUT_MS },
-                speechConfig: {
-                  multiSpeakerVoiceConfig: {
-                    speakerVoiceConfigs: speakerConfigs.map((sp) => ({
-                      speaker: sp.speaker,
-                      voiceConfig: {
-                        prebuiltVoiceConfig: {
-                          voiceName: sp.voiceName,
-                        },
-                      },
-                    })),
-                  },
-                },
-              },
-            });
-
-            const data = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-            if (!data || data.length < 64) {
-              throw new Error('Multi-speaker TTS returned empty audio data.');
-            }
-            return data;
-          },
-        });
-
-        setBoundedCache(cacheKey, {
-          audioBase64: base64Audio,
-          provider: this.name,
-        });
-
-        return {
-          result: {
-            audioBase64: base64Audio,
-            mimeType: 'audio/wav',
-            cached: false,
-            provider: this.name,
-            retryCount,
-            queueWaitMs,
-          },
-          reusedFromCache: false,
-          retryCount,
-          httpStatus: 200,
-          model: this.name,
-        };
-      },
-    });
+    return {
+      audioBase64: stitched.fullWav.toString('base64'),
+      mimeType: 'audio/wav',
+      cached: turnUpstreamCalls === 0 && turnCacheHits > 0,
+      cacheLayer: turnUpstreamCalls === 0 ? 'disk' : 'upstream',
+      provider: lastProvider,
+      providerId: DEFAULT_TTS_PROVIDER,
+      locale: DEFAULT_TTS_LOCALE,
+      acoustics,
+      retryCount: totalRetries,
+      queueWaitMs: totalQueueWaitMs,
+      turnTimings: stitched.timings,
+      turnWavsBase64,
+      turnCacheHits,
+      turnUpstreamCalls,
+    };
   }
 }
 

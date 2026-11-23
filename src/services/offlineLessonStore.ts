@@ -1,6 +1,12 @@
-import type { Lesson } from '../types/domain';
+import type { Lesson, SpeakerProfile } from '../types/domain';
 import { findSpeakerProfile } from '../utils/speakerUtils';
 import { stripStressMarks } from '../utils/transcriptDiff';
+import {
+  buildRussianStylePrompt,
+  buildVoiceCacheSignature,
+  getDefaultRussianNarratorSpeaker,
+  resolveVoiceProfile,
+} from '../utils/voiceRegistry';
 
 const DB_NAME = 'rd_offline_store_v1';
 const DB_VERSION = 1;
@@ -24,9 +30,45 @@ interface OfflineAudioRecord {
   lessonId: string;
   sentenceId: string;
   voiceName: string;
+  gender?: 'male' | 'female';
+  provider?: string;
+  model?: string;
+  voiceSignature?: string;
   blob: Blob;
   bytes: number;
   cachedAt: string;
+}
+
+export function computeOfflineVoiceSignature(
+  text: string,
+  speaker?: SpeakerProfile,
+  topic?: string,
+): string {
+  const effectiveSpeaker = speaker ?? getDefaultRussianNarratorSpeaker('female');
+  const resolved = resolveVoiceProfile(effectiveSpeaker.voiceName, effectiveSpeaker.gender, {
+    ageStyle: effectiveSpeaker.ageStyle,
+    speakingStyle: effectiveSpeaker.speakingStyle,
+    speakingRate: effectiveSpeaker.speakingRate,
+    emotion: effectiveSpeaker.emotion,
+  });
+  const stylePrompt = buildRussianStylePrompt(resolved, {
+    speakerRole: effectiveSpeaker.roleEn || effectiveSpeaker.roleVi,
+    topic,
+  });
+  return buildVoiceCacheSignature({
+    text,
+    provider: resolved.provider,
+    model: resolved.model,
+    voiceId: resolved.voiceId,
+    locale: resolved.locale,
+    gender: resolved.gender,
+    ageStyle: resolved.ageStyle,
+    speakingStyle: resolved.speakingStyle,
+    speakingRate: resolved.speakingRate,
+    pitch: resolved.pitch,
+    emotion: resolved.emotion,
+    stylePrompt,
+  });
 }
 
 function openOfflineDb(): Promise<IDBDatabase> {
@@ -93,6 +135,7 @@ export async function getOfflineLesson(lessonId: string): Promise<OfflineLessonR
 export async function getOfflineSentenceAudioBlob(
   lessonId: string,
   sentenceId: string,
+  expectedSignature?: string,
 ): Promise<Blob | null> {
   try {
     const db = await openOfflineDb();
@@ -102,7 +145,23 @@ export async function getOfflineSentenceAudioBlob(
       const req = tx.objectStore(STORE_AUDIO).get(key);
       req.onsuccess = () => {
         const rec = req.result as OfflineAudioRecord | undefined;
-        resolve(rec?.blob ?? null);
+        if (!rec?.blob || rec.blob.size <= 44) {
+          resolve(null);
+          return;
+        }
+        if (expectedSignature) {
+          if (rec.voiceSignature && rec.voiceSignature !== expectedSignature) {
+            resolve(null);
+            return;
+          }
+          const isOnlineNow = typeof navigator === 'undefined' ? true : navigator.onLine;
+          if (!rec.voiceSignature && isOnlineNow) {
+            // Avoid serving unversioned pre-upgrade audio when online so fresh voice config applies
+            resolve(null);
+            return;
+          }
+        }
+        resolve(rec.blob);
       };
       req.onerror = () => reject(req.error);
     });
@@ -163,11 +222,27 @@ export async function downloadLessonForOffline(
       }
 
       const sentence = lesson.sentences[i];
-      const prevSentence = i > 0 ? lesson.sentences[i - 1] : undefined;
-      const speakerProfile = findSpeakerProfile(lesson.speakers, sentence.speaker);
+      const speakerProfile =
+        findSpeakerProfile(lesson.speakers, sentence.speaker) ??
+        getDefaultRussianNarratorSpeaker('female');
+      const resolvedVoice = resolveVoiceProfile(speakerProfile.voiceName, speakerProfile.gender, {
+        ageStyle: speakerProfile.ageStyle,
+        speakingStyle: speakerProfile.speakingStyle,
+        speakingRate: speakerProfile.speakingRate,
+        emotion: speakerProfile.emotion,
+      });
       const cleanText = stripStressMarks(sentence.text).trim();
+      const voiceSignature = computeOfflineVoiceSignature(
+        cleanText,
+        speakerProfile,
+        options.topicEn,
+      );
 
-      const existing = await getOfflineSentenceAudioBlob(lesson.id, sentence.id);
+      const existing = await getOfflineSentenceAudioBlob(
+        lesson.id,
+        sentence.id,
+        voiceSignature,
+      );
       if (existing) {
         cachedAudioCount += 1;
         totalAudioBytes += existing.size;
@@ -177,6 +252,8 @@ export async function downloadLessonForOffline(
 
       try {
         let blob: Blob | null = null;
+        let providerName: string = resolvedVoice.model;
+
         if (sentence.audioUrl) {
           const preGeneratedResp = await fetch(sentence.audioUrl, {
             signal: options.signal,
@@ -196,16 +273,15 @@ export async function downloadLessonForOffline(
             signal: options.signal,
             body: JSON.stringify({
               text: cleanText,
-              voiceName: speakerProfile?.voiceName,
-              gender: speakerProfile?.gender,
-              speakerRole: speakerProfile?.roleEn || speakerProfile?.roleVi,
+              voiceName: resolvedVoice.voiceId,
+              gender: resolvedVoice.gender,
+              ageStyle: resolvedVoice.ageStyle,
+              speakingStyle: resolvedVoice.speakingStyle,
+              speakingRate: resolvedVoice.speakingRate,
+              emotion: resolvedVoice.emotion,
+              speakerRole: speakerProfile.roleEn || speakerProfile.roleVi,
               topic: options.topicEn,
-              previousSpeaker: prevSentence
-                ? stripStressMarks(prevSentence.speaker).trim()
-                : undefined,
-              previousText: prevSentence
-                ? stripStressMarks(prevSentence.text).trim()
-                : undefined,
+              lessonId: lesson.id,
             }),
           });
 
@@ -213,6 +289,16 @@ export async function downloadLessonForOffline(
             const data = await resp.json();
             if (data.audioBase64) {
               blob = base64ToWavBlob(data.audioBase64, data.mimeType || 'audio/wav');
+              if (typeof data.provider === 'string') {
+                providerName = data.provider;
+              }
+            }
+          } else if (resp.status === 429) {
+            // Stop immediately if Free-Tier daily quota is exhausted — save lesson text & already-cached audio
+            const errBody = await resp.json().catch(() => null);
+            if (errBody?.errorCategory === 'daily_quota_exhausted') {
+              options.onProgress?.(total, total);
+              break;
             }
           }
         }
@@ -222,7 +308,11 @@ export async function downloadLessonForOffline(
             key: `${lesson.id}::${sentence.id}`,
             lessonId: lesson.id,
             sentenceId: sentence.id,
-            voiceName: speakerProfile?.voiceName ?? 'Kore',
+            voiceName: resolvedVoice.voiceId,
+            gender: resolvedVoice.gender,
+            provider: resolvedVoice.provider,
+            model: providerName,
+            voiceSignature,
             blob,
             bytes: blob.size,
             cachedAt: new Date().toISOString(),

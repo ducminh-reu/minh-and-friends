@@ -5,6 +5,7 @@ import { REVIEW_STATUS_LABELS, t } from '../i18n/translations';
 import { russianAudioEngine } from '../services/audioPlayer';
 import type { ReviewStatus } from '../types/domain';
 import { getRetentionRate } from '../utils/spacedRepetition';
+import { getDefaultRussianNarratorSpeaker } from '../utils/voiceRegistry';
 
 export const VocabularyNotebookPage: React.FC = () => {
   const {
@@ -33,6 +34,7 @@ export const VocabularyNotebookPage: React.FC = () => {
   const [newPos, setNewPos] = useState('существительное');
   const [newForms, setNewForms] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
+  const [audioNotice, setAudioNotice] = useState<string | null>(null);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -98,6 +100,22 @@ export const VocabularyNotebookPage: React.FC = () => {
           <span>Thêm từ mới</span>
         </button>
       </div>
+
+      {audioNotice && (
+        <div
+          role="alert"
+          className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-800 flex items-center justify-between gap-3"
+        >
+          <span>{audioNotice}</span>
+          <button
+            type="button"
+            onClick={() => setAudioNotice(null)}
+            className="font-semibold underline shrink-0"
+          >
+            Đóng
+          </button>
+        </div>
+      )}
 
       {/* Search & Status Filter */}
       <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col md:flex-row gap-3 items-stretch md:items-center justify-between">
@@ -170,13 +188,17 @@ export const VocabularyNotebookPage: React.FC = () => {
                     <div className="flex items-center gap-1.5 shrink-0">
                       <button
                         type="button"
-                        onClick={() =>
+                        onClick={() => {
+                          setAudioNotice(null);
                           void russianAudioEngine.playSentence({
                             text: item.word,
+                            speaker: getDefaultRussianNarratorSpeaker('female'),
                             speed: 1,
-                            preferServerTts: capabilities.ttsAvailable && isOnline,
-                          })
-                        }
+                            preferServerTts:
+                              profile.ttsPreference === 'auto' && capabilities.ttsAvailable && isOnline,
+                            onError: (msg) => setAudioNotice(msg),
+                          });
+                        }}
                         aria-label={`Phát âm ${item.word}`}
                         className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50"
                       >

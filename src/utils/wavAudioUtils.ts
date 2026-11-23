@@ -290,3 +290,161 @@ export function concatenateWavSegments(
 
   return { fullWav, timings, totalDurationSec };
 }
+
+export interface WavAcousticDiagnostics {
+  valid: boolean;
+  bytes: number;
+  sampleRate: number;
+  numChannels: number;
+  bitsPerSample: number;
+  durationSec: number;
+  rms: number;
+  rmsDb: number;
+  peakAmplitude: number;
+  clippingDetected: boolean;
+  isSilent: boolean;
+}
+
+/**
+ * Inspects a WAV buffer's PCM energy, duration, silence, and clipping to prevent
+ * caching corrupt/silent/truncated audio and to verify real QA audio samples.
+ */
+export function analyzeWavAcoustics(rawBuffer: Buffer): WavAcousticDiagnostics {
+  if (!rawBuffer || rawBuffer.length <= 44 || !isRiffWavBuffer(rawBuffer)) {
+    return {
+      valid: false,
+      bytes: rawBuffer?.length ?? 0,
+      sampleRate: 0,
+      numChannels: 0,
+      bitsPerSample: 0,
+      durationSec: 0,
+      rms: 0,
+      rmsDb: -Infinity,
+      peakAmplitude: 0,
+      clippingDetected: false,
+      isSilent: true,
+    };
+  }
+
+  const parsed = parseWavBuffer(rawBuffer);
+  const totalFrames = Math.floor(parsed.pcmData.length / Math.max(1, parsed.blockAlign));
+  if (totalFrames <= 0 || parsed.bitsPerSample !== 16) {
+    return {
+      valid: false,
+      bytes: rawBuffer.length,
+      sampleRate: parsed.sampleRate,
+      numChannels: parsed.numChannels,
+      bitsPerSample: parsed.bitsPerSample,
+      durationSec: Number(parsed.durationSec.toFixed(2)),
+      rms: 0,
+      rmsDb: -Infinity,
+      peakAmplitude: 0,
+      clippingDetected: false,
+      isSilent: true,
+    };
+  }
+
+  let sumSq = 0;
+  let maxAbs = 0;
+  let clippedSamples = 0;
+
+  for (let f = 0; f < totalFrames; f += 1) {
+    const sample = parsed.pcmData.readInt16LE(f * parsed.blockAlign);
+    const abs = Math.abs(sample);
+    if (abs > maxAbs) maxAbs = abs;
+    if (abs >= 32760) clippedSamples += 1;
+    const norm = sample / 32768;
+    sumSq += norm * norm;
+  }
+
+  const rms = Math.sqrt(sumSq / totalFrames);
+  const peakAmplitude = Number((maxAbs / 32768).toFixed(4));
+  const rmsDb = rms > 0 ? Number((20 * Math.log10(rms)).toFixed(1)) : -Infinity;
+  const isSilent = rms < 0.0015 || parsed.durationSec < 0.15;
+  const clippingDetected = clippedSamples > Math.max(12, totalFrames * 0.005);
+
+  return {
+    valid: !isSilent && parsed.durationSec >= 0.15,
+    bytes: rawBuffer.length,
+    sampleRate: parsed.sampleRate,
+    numChannels: parsed.numChannels,
+    bitsPerSample: parsed.bitsPerSample,
+    durationSec: Number(parsed.durationSec.toFixed(2)),
+    rms: Number(rms.toFixed(5)),
+    rmsDb,
+    peakAmplitude,
+    clippingDetected,
+    isSilent,
+  };
+}
+
+/**
+ * Stitches individually synthesized sentence WAVs into a single natural conversation WAV,
+ * applying realistic conversational pauses (longer pause when speaker changes, shorter pause
+ * when the same speaker continues) and returning exact sample-accurate timings per sentence.
+ */
+export function concatenateWavSegmentsWithTurnPauses(
+  turns: { speaker: string; wav: Buffer }[],
+  options: { sameSpeakerPauseMs?: number; speakerSwitchPauseMs?: number } = {},
+): {
+  fullWav: Buffer;
+  timings: { startSec: number; endSec: number; durationSec: number }[];
+  totalDurationSec: number;
+} {
+  if (turns.length === 0) {
+    const empty = encodeWavFromPcm(Buffer.alloc(0));
+    return { fullWav: empty, timings: [], totalDurationSec: 0 };
+  }
+
+  const samePauseMs = options.sameSpeakerPauseMs ?? 210;
+  const switchPauseMs = options.speakerSwitchPauseMs ?? 360;
+
+  const parsedTurns = turns.map((t) => ({
+    speaker: t.speaker.normalize('NFC').replace(/\u0301/g, '').trim().toLowerCase(),
+    parsed: parseWavBuffer(t.wav),
+  }));
+
+  const base = parsedTurns[0].parsed;
+  const samePauseFrames = Math.max(0, Math.round((base.sampleRate * samePauseMs) / 1000));
+  const switchPauseFrames = Math.max(0, Math.round((base.sampleRate * switchPauseMs) / 1000));
+  const samePauseBuf = Buffer.alloc(samePauseFrames * base.blockAlign);
+  const switchPauseBuf = Buffer.alloc(switchPauseFrames * base.blockAlign);
+
+  const chunks: Buffer[] = [];
+  const timings: { startSec: number; endSec: number; durationSec: number }[] = [];
+  let cursorFrames = 0;
+
+  for (let i = 0; i < parsedTurns.length; i += 1) {
+    const cur = parsedTurns[i];
+    const segFrames = Math.floor(cur.parsed.pcmData.length / cur.parsed.blockAlign);
+    const startSec = Number((cursorFrames / base.sampleRate).toFixed(2));
+    const endSec = Number(((cursorFrames + segFrames) / base.sampleRate).toFixed(2));
+    const durationSec = Number(Math.max(0, endSec - startSec).toFixed(2));
+
+    chunks.push(cur.parsed.pcmData);
+    timings.push({ startSec, endSec, durationSec });
+    cursorFrames += segFrames;
+
+    if (i < parsedTurns.length - 1) {
+      const next = parsedTurns[i + 1];
+      const speakerChanged = cur.speaker !== next.speaker;
+      const pauseBuf = speakerChanged ? switchPauseBuf : samePauseBuf;
+      const pauseFrames = speakerChanged ? switchPauseFrames : samePauseFrames;
+      if (pauseBuf.length > 0) {
+        chunks.push(pauseBuf);
+        cursorFrames += pauseFrames;
+      }
+    }
+  }
+
+  const fullPcm = Buffer.concat(chunks);
+  const fullWav = encodeWavFromPcm(
+    fullPcm,
+    base.sampleRate,
+    base.numChannels,
+    base.bitsPerSample,
+  );
+  const totalDurationSec = Number((cursorFrames / base.sampleRate).toFixed(2));
+
+  return { fullWav, timings, totalDurationSec };
+}

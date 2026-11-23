@@ -1,10 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Check, Copy, Download, HardDrive, RotateCcw, Trash2 } from 'lucide-react';
+import { Check, Download, HardDrive, RotateCcw, Trash2 } from 'lucide-react';
 import { AuthSyncSection } from '../components/AuthSyncSection';
 import { PWAInstallButton } from '../components/PWAInstallButton';
 import { SYNC_STATUS_LABELS } from '../components/SyncStatusBadge';
+import { TtsQaPanel } from '../components/TtsQaPanel';
 import { useAppState } from '../context/AppStateContext';
-import { SUPABASE_SCHEMA_SQL } from '../data/seedUserData';
+
 import { t } from '../i18n/translations';
 import type { DictationMode, InterfaceLanguage, PlaybackSpeed } from '../types/domain';
 import { formatStorageBytes, summarizeOfflineStorage } from '../utils/offlineFormatters';
@@ -27,15 +28,12 @@ export const SettingsPage: React.FC = () => {
   const lang = profile.interfaceLanguage;
 
   const [savedToast, setSavedToast] = useState(false);
-  const [copiedSql, setCopiedSql] = useState(false);
   const [clearingOffline, setClearingOffline] = useState(false);
   const toastTimerRef = useRef<number | null>(null);
-  const copyTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     return () => {
       if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
-      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
     };
   }, []);
 
@@ -62,12 +60,7 @@ export const SettingsPage: React.FC = () => {
     URL.revokeObjectURL(url);
   };
 
-  const handleCopySql = () => {
-    void navigator.clipboard?.writeText(SUPABASE_SCHEMA_SQL);
-    setCopiedSql(true);
-    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
-    copyTimerRef.current = window.setTimeout(() => setCopiedSql(false), 2000);
-  };
+
 
   const handleClearOffline = async () => {
     setClearingOffline(true);
@@ -309,11 +302,13 @@ export const SettingsPage: React.FC = () => {
               }
               className="w-full min-h-[44px] px-3 py-2 text-sm border border-slate-200 rounded-lg bg-white"
             >
-              <option value="auto">Tự động (Server TTS → Trình duyệt)</option>
-              <option value="browser">Chỉ giọng đọc trình duyệt (ru-RU)</option>
+              <option value="auto">Tự động — Gemini TTS miễn phí (Ưu tiên bộ nhớ đệm)</option>
+              <option value="browser">Thủ công — Giọng đọc trình duyệt cục bộ (ru-RU)</option>
             </select>
           </div>
         </div>
+
+        <TtsQaPanel ttsAvailable={capabilities.ttsAvailable} isOnline={isOnline} />
       </section>
 
       {/* Adaptive Thresholds Info */}
@@ -358,9 +353,11 @@ export const SettingsPage: React.FC = () => {
             </div>
           </div>
           <div className="p-3.5 rounded-lg border border-slate-200">
-            <div className="text-slate-500">Russian TTS (Gemini 3.8 TTS)</div>
+            <div className="text-slate-500">Giọng đọc tiếng Nga ({capabilities.ttsProvider || 'gemini-3.8-flash-lite-tts'})</div>
             <div className="font-semibold text-[#0F2342] mt-1">
-              {capabilities.ttsAvailable ? 'Sẵn sàng trên máy chủ' : 'Dùng trình duyệt / Mô phỏng'}
+              {capabilities.ttsAvailable
+                ? 'Sẵn sàng trên máy chủ (Free Tier · Cache ổ đĩa)'
+                : 'Chưa cấu hình (Dùng giọng trình duyệt)'}
             </div>
           </div>
           <div className="p-3.5 rounded-lg border border-slate-200">
@@ -375,21 +372,7 @@ export const SettingsPage: React.FC = () => {
           </div>
         </div>
 
-        <div className="pt-2 space-y-2">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="text-xs font-medium text-slate-600">
-              Lược đồ SQL & Row Level Security (Phase 4 Supabase)
-            </span>
-            <button
-              type="button"
-              onClick={handleCopySql}
-              className="inline-flex items-center gap-1 min-h-[44px] px-2 text-xs font-medium text-[#1E4178] hover:underline"
-            >
-              {copiedSql ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-              <span>{copiedSql ? 'Đã sao chép SQL' : 'Sao chép SQL Schema'}</span>
-            </button>
-          </div>
-        </div>
+
 
         <div className="flex flex-wrap items-center gap-3 pt-4 border-t border-slate-100">
           <button

@@ -7,11 +7,13 @@ import type {
   NewsPipelineStatusResponse,
 } from '../src/types/domain.ts';
 import { canonicalizeNewsUrl, selectDailyPipelineStories } from '../src/utils/newsFeedUtils.ts';
+import { findSpeakerProfile } from '../src/utils/speakerUtils.ts';
+import { assignDistinctSpeakerVoices } from '../src/utils/voiceRegistry.ts';
 import {
-  concatenateWavSegments,
+  analyzeWavAcoustics,
+  concatenateWavSegmentsWithTurnPauses,
   ensureWavBuffer,
   parseWavBuffer,
-  splitWavIntoSentenceSegments,
 } from '../src/utils/wavAudioUtils.ts';
 import { stripStressMarks } from '../src/utils/transcriptDiff.ts';
 import {
@@ -102,10 +104,13 @@ export async function synthesizeAndSplitLessonAudio(
 ): Promise<SynthesizeLessonAudioResult> {
   const activeProvider = options.providerOverride ?? ttsProvider;
   const activeModel = activeProvider.name || CONFIGURED_TTS_MODEL;
-  const audioConfigHash = computeLessonAudioConfigHash(lesson, activeModel);
-  const hasValidDiskAudio = hasValidLessonAudioOnDisk(lesson);
+  const assignedSpeakers = assignDistinctSpeakerVoices(lesson.speakers);
+  const normalizedLesson: Lesson = { ...lesson, speakers: assignedSpeakers };
+  const audioConfigHash = computeLessonAudioConfigHash(normalizedLesson, activeModel);
+  const hasValidDiskAudio = hasValidLessonAudioOnDisk(normalizedLesson);
   const configMatches =
-    !lesson.newsMetadata?.audioConfigHash || lesson.newsMetadata.audioConfigHash === audioConfigHash;
+    !normalizedLesson.newsMetadata?.audioConfigHash ||
+    normalizedLesson.newsMetadata.audioConfigHash === audioConfigHash;
 
   // Reuse existing valid audio for the same lesson + audio config unless forceRegenerate is explicitly requested
   if (
@@ -195,138 +200,62 @@ export async function synthesizeAndSplitLessonAudio(
 
     try {
       const topicLabel = lesson.newsMetadata?.newsTopic ?? lesson.topic;
-
-      if (lesson.speakers.length === 2 && lesson.sentences.length > 0) {
-        // Synthesize whole 2-speaker news dialogue in 1 queued Gemini TTS call, then split into per-sentence WAV segments
-        const ttsResult = await activeProvider.synthesizeDialogue({
-          lessonId: lesson.id,
-          cefrLevel: lesson.level,
-          topic: topicLabel,
-          forceRegenerate: options.forceRegenerate,
-          bypassDailyCooldown: options.bypassDailyCooldown,
-          speakers: lesson.speakers.map((sp) => ({
-            speaker: sp.name,
-            voiceName: sp.voiceName,
-            gender: sp.gender,
-            role: sp.roleEn || sp.roleVi,
-          })),
-          turns: lesson.sentences.map((s) => ({
-            speaker: s.speaker,
-            text: s.text,
-          })),
-        });
-
-        const rawBytes = Buffer.from(ttsResult.audioBase64, 'base64');
-        const fullWav = ensureWavBuffer(rawBytes, 24000);
-        if (fullWav.length <= 44) {
-          throw new Error('Synthesized dialogue WAV buffer is empty.');
-        }
-
-        const parsedFull = parseWavBuffer(fullWav);
-        const weights = lesson.sentences.map((s) =>
-          Math.max(2, stripStressMarks(s.text).trim().split(/\s+/).length),
-        );
-        const segments = splitWavIntoSentenceSegments(fullWav, weights);
-        if (segments.length !== lesson.sentences.length) {
-          throw new Error(
-            `Expected ${lesson.sentences.length} WAV segments but produced ${segments.length}.`,
-          );
-        }
-
-        const saved = saveLessonAudioFilesToDisk(
-          lesson.id,
-          fullWav,
-          segments.map((seg, idx) => ({
-            order: lesson.sentences[idx].order,
-            wav: seg.segmentWav,
-          })),
-        );
-
-        const updatedSentences = lesson.sentences.map((s, idx) => {
-          const segTiming = segments[idx];
-          const segMeta = saved.segmentUrls.get(s.order);
-          return {
-            ...s,
-            startSec: segTiming?.startSec ?? s.startSec,
-            endSec: segTiming?.endSec ?? s.endSec,
-            audioUrl: segMeta?.audioUrl ?? null,
-          };
-        });
-
-        const segmentFilePaths = new Map<number, string>();
-        saved.segmentUrls.forEach((v, order) => segmentFilePaths.set(order, v.filePath));
-
-        const updatedLesson: Lesson = {
-          ...lesson,
-          durationSec: Math.max(20, Math.round(parsedFull.durationSec)),
-          sentences: updatedSentences,
-          newsMetadata: lesson.newsMetadata
-            ? {
-                ...lesson.newsMetadata,
-                fullAudioUrl: saved.fullAudioUrl,
-                audioStatus: 'ready',
-                audioError: null,
-                audioErrorCategory: 'none',
-                audioConfigHash,
-                audioQueueState: 'completed',
-                audioSegmentsCount: segments.length,
-              }
-            : undefined,
-        };
-
-        const persisted =
-          !options.skipDbPersistence && lesson.newsMetadata
-            ? saveNewsLessonWithSegments(
-                buildArticleStubFromLesson(lesson),
-                updatedLesson,
-                segmentFilePaths,
-              )
-            : updatedLesson;
-
-        return {
-          lesson: persisted,
-          segmentsSaved: segments.length,
-          error: null,
-          errorCategory: 'none',
-          reusedFromCache: Boolean(ttsResult.cached),
-          queueState: 'completed',
-        };
-      }
-
-      // 1-speaker summary format: synthesize each sentence sequentially through the 1-concurrency TTS queue and stitch full.wav
-      const primarySpeaker = lesson.speakers[0];
-      const segWavs: { order: number; wav: Buffer }[] = [];
+      const isMultiSpeaker = assignedSpeakers.length >= 2;
+      const segWavs: { order: number; speaker: string; wav: Buffer }[] = [];
       let allReused = lesson.sentences.length > 0;
 
+      // Exact per-turn synthesis for 1, 2, 3, or more speakers:
+      // - Every speaker keeps their fixed gender-locked voiceId across the entire lesson.
+      // - Every sentence WAV is acoustically verified and individually cached (0 boundary chopping!).
+      // - full.wav is stitched with natural pauses (360ms speaker switch / 210ms same speaker).
       for (let i = 0; i < lesson.sentences.length; i += 1) {
         const s = lesson.sentences[i];
+        const speakerProfile =
+          findSpeakerProfile(assignedSpeakers, s.speaker) ?? assignedSpeakers[0];
         const prev = i > 0 ? lesson.sentences[i - 1] : undefined;
+
         const singleRes = await activeProvider.synthesize({
           lessonId: `${lesson.id}-s${s.order}`,
           cefrLevel: lesson.level,
           text: s.text,
-          voiceName: primarySpeaker?.voiceName,
-          gender: primarySpeaker?.gender,
-          speakerRole: primarySpeaker?.roleEn || primarySpeaker?.roleVi,
+          voiceName: speakerProfile?.voiceName,
+          gender: speakerProfile?.gender,
+          ageStyle: speakerProfile?.ageStyle,
+          speakingStyle:
+            speakerProfile?.speakingStyle ?? (isMultiSpeaker ? 'conversational' : 'narration'),
+          speakingRate: speakerProfile?.speakingRate,
+          emotion: speakerProfile?.emotion,
+          speakerRole: speakerProfile?.roleEn || speakerProfile?.roleVi,
           topic: topicLabel,
           previousSpeaker: prev?.speaker,
           previousText: prev?.text,
           forceRegenerate: options.forceRegenerate,
           bypassDailyCooldown: options.bypassDailyCooldown,
         });
+
         if (!singleRes.cached) allReused = false;
         const wavBuf = ensureWavBuffer(Buffer.from(singleRes.audioBase64, 'base64'), 24000);
-        if (wavBuf.length <= 44) {
-          throw new Error(`Synthesized sentence ${s.order} WAV buffer is empty.`);
+        const acoustics = analyzeWavAcoustics(wavBuf);
+        if (!acoustics.valid) {
+          throw new Error(`Synthesized sentence ${s.order} WAV buffer is invalid or silent.`);
         }
-        segWavs.push({ order: s.order, wav: wavBuf });
+        segWavs.push({
+          order: s.order,
+          speaker: speakerProfile?.name ?? s.speaker,
+          wav: wavBuf,
+        });
       }
 
-      const stitched = concatenateWavSegments(
-        segWavs.map((x) => x.wav),
-        280,
+      const stitched = concatenateWavSegmentsWithTurnPauses(
+        segWavs.map((x) => ({ speaker: x.speaker, wav: x.wav })),
+        { sameSpeakerPauseMs: 210, speakerSwitchPauseMs: 360 },
       );
-      const saved = saveLessonAudioFilesToDisk(lesson.id, stitched.fullWav, segWavs);
+      const parsedFull = parseWavBuffer(stitched.fullWav);
+      const saved = saveLessonAudioFilesToDisk(
+        lesson.id,
+        stitched.fullWav,
+        segWavs.map((x) => ({ order: x.order, wav: x.wav })),
+      );
       const segmentFilePaths = new Map<number, string>();
       saved.segmentUrls.forEach((v, order) => segmentFilePaths.set(order, v.filePath));
 
@@ -339,7 +268,8 @@ export async function synthesizeAndSplitLessonAudio(
 
       const updatedLesson: Lesson = {
         ...lesson,
-        durationSec: Math.max(20, Math.round(stitched.totalDurationSec)),
+        speakers: assignedSpeakers,
+        durationSec: Math.max(10, Math.round(parsedFull.durationSec)),
         sentences: updatedSentences,
         newsMetadata: lesson.newsMetadata
           ? {
@@ -824,7 +754,9 @@ export function startDailyNewsScheduler(): void {
     schedulerTimer.unref();
   }
 
-  if (process.env.DISABLE_AUTO_NEWS_STARTUP !== '1' && !startupTimer) {
+  // Free-Tier quota protection: never auto-burn TTS/text quota on server startup/deploy
+  // unless explicitly opted in via ENABLE_AUTO_NEWS_STARTUP=1.
+  if (process.env.ENABLE_AUTO_NEWS_STARTUP === '1' && !startupTimer) {
     startupTimer = setTimeout(() => {
       startupTimer = null;
       const todayKey = new Date().toISOString().slice(0, 10);

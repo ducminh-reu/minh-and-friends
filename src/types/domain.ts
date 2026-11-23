@@ -18,12 +18,55 @@ export type DictationMode = 'sentence' | 'full';
 
 export type PlaybackSpeed = 0.75 | 0.85 | 1 | 1.15;
 
+export type TtsProviderId = 'gemini-tts';
+
+export type TtsModelId = 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts';
+
+export type GeminiVoiceId =
+  | 'Sulafat'
+  | 'Despina'
+  | 'Leda'
+  | 'Gacrux'
+  | 'Kore'
+  | 'Zephyr'
+  | 'Achird'
+  | 'Charon'
+  | 'Algieba'
+  | 'Sadaltager'
+  | 'Puck'
+  | 'Fenrir';
+
+export type VoiceAgeStyle = 'young' | 'mature';
+
+export type VoiceSpeakingStyle = 'conversational' | 'narration' | 'educational';
+
+export interface VoiceConfigProfile {
+  voiceId: GeminiVoiceId;
+  provider: TtsProviderId;
+  model: TtsModelId;
+  language: 'Russian';
+  locale: 'ru-RU';
+  gender: 'male' | 'female';
+  ageStyle: VoiceAgeStyle;
+  speakingStyle: VoiceSpeakingStyle;
+  speakingRate: number;
+  pitch: number | null;
+  emotion: string;
+  labelVi: string;
+  labelEn: string;
+  styleDirective: string;
+}
+
 export interface SpeakerProfile {
   name: string;
   roleVi: string;
   roleEn: string;
-  voiceName: 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr';
+  voiceName: GeminiVoiceId;
   gender: 'male' | 'female';
+  ageStyle?: VoiceAgeStyle;
+  speakingStyle?: VoiceSpeakingStyle;
+  speakingRate?: number;
+  emotion?: string;
 }
 
 export interface DialogueSentence {

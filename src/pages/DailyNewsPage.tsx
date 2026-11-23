@@ -111,6 +111,8 @@ export const DailyNewsPage: React.FC = () => {
   const [generatingArticleId, setGeneratingArticleId] = useState<string | null>(null);
   const [generateError, setGenerateError] = useState<string | null>(null);
   const [justGeneratedLessonId, setJustGeneratedLessonId] = useState<string | null>(null);
+  const [articleLevels, setArticleLevels] = useState<Record<string, CefrLevel>>({});
+  const [articleFormats, setArticleFormats] = useState<Record<string, NewsFormat>>({});
   const generatingRef = useRef<boolean>(false);
   const retryingRef = useRef<boolean>(false);
 
@@ -340,7 +342,11 @@ export const DailyNewsPage: React.FC = () => {
     }
   };
 
-  const handleGenerateLessonFromArticle = async (article: NewsArticle) => {
+  const handleGenerateLessonFromArticle = async (
+    article: NewsArticle,
+    targetLevel: CefrLevel,
+    targetFormat: NewsFormat,
+  ) => {
     if (generatingRef.current || generatingArticleId) return;
     if (!isOnline) {
       setGenerateError('Đang ngoại tuyến — Cần kết nối mạng để tạo bài nghe từ tin tức.');
@@ -358,8 +364,8 @@ export const DailyNewsPage: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           article,
-          level: effectiveTargetLevel,
-          format,
+          level: targetLevel,
+          format: targetFormat,
         }),
       });
       const data = (await resp.json()) as {
@@ -773,243 +779,7 @@ export const DailyNewsPage: React.FC = () => {
         </div>
       )}
 
-      {/* SECTION 1: Persisted & Generated News Dictation Lessons */}
-      <section aria-label="Bài luyện nghe chép từ tin tức" className="space-y-4">
-        <div className="flex flex-wrap items-baseline justify-between gap-2">
-          <div>
-            <h2 className="text-lg font-bold text-[#0F2342]">
-              Bài luyện nghe từ tin tức ({filteredNewsLessons.length})
-            </h2>
-            <p className="text-xs text-slate-600 mt-0.5">
-              Lưu trữ trên cơ sở dữ liệu theo từng cấp độ B1–C2 với bản tóm tắt tiếng Nga, hội thoại, giải thích ngữ pháp–từ vựng Nga–Việt và file audio tách từng câu.
-            </p>
-          </div>
-        </div>
 
-        {filteredNewsLessons.length === 0 ? (
-          <div className="bg-white border border-slate-200 rounded-xl p-6 text-sm text-slate-600">
-            {newsLessons.length === 0
-              ? 'Chưa có bài luyện nghe tin tức nào trong cơ sở dữ liệu. Hãy nhấn "Cập nhật bản tin B1–C2 ngay" hoặc chọn một bản tin xác thực bên dưới.'
-              : 'Không có bài luyện nghe tin tức nào khớp với bộ lọc hiện tại.'}
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            {filteredNewsLessons.map((lesson) => {
-              const meta = lesson.newsMetadata!;
-              const offlineRec = offlineMap.get(lesson.id);
-              const isDownloading = downloadingId === lesson.id;
-              const isRetryingAudio = retryingAudioId === lesson.id;
-              const isJustCreated = justGeneratedLessonId === lesson.id;
-              const isPersistedInDb = serverNewsIdSet.has(lesson.id);
-              const canDelete = lesson.source !== 'curated';
-              const audioReady = meta.audioStatus === 'ready' && Boolean(meta.fullAudioUrl);
-
-              return (
-                <article
-                  key={lesson.id}
-                  className={`bg-white rounded-xl p-5 flex flex-col justify-between gap-4 border ${
-                    isJustCreated
-                      ? 'border-[#1F7A6E] ring-1 ring-[#1F7A6E]/25'
-                      : 'border-slate-200'
-                  }`}
-                >
-                  <div className="space-y-4">
-                    {/* Top unboxed metadata */}
-                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="font-semibold text-[#0F2342]">CEFR {lesson.level}</span>
-                        <span aria-hidden="true">·</span>
-                        <span>{NEWS_TOPIC_LABELS[meta.newsTopic][lang]}</span>
-                        <span aria-hidden="true">·</span>
-                        <span>{meta.format === 'dialogue' ? 'Hội thoại + Tóm tắt' : 'Bản tin'}</span>
-                      </div>
-                      <span className="tabular-nums text-slate-500">
-                        ~{Math.max(1, Math.round(lesson.durationSec / 60))} phút ·{' '}
-                        {lesson.sentences.length} câu · {lesson.vocabulary.length} từ
-                      </span>
-                    </div>
-
-                    {/* AI Educational Lesson Title & Russian Educational Summary */}
-                    <div className="space-y-2">
-                      <div className="text-[11px] font-semibold text-[#1E4178]">
-                        Nội dung luyện nghe giáo dục do AI biên soạn
-                      </div>
-                      <h3 className="text-lg font-bold text-[#0F2342] cyrillic-prose leading-snug">
-                        {lesson.titleRu}
-                      </h3>
-                      <p className="text-sm font-medium text-slate-700">{lesson.titleVi}</p>
-
-                      {meta.educationalSummaryRu && (
-                        <div className="text-xs text-slate-700 leading-relaxed pt-1 space-y-1">
-                          <p className="cyrillic-prose text-[#0F2342]">{meta.educationalSummaryRu}</p>
-                          {meta.educationalSummaryVi && (
-                            <p className="text-slate-600">{meta.educationalSummaryVi}</p>
-                          )}
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Hairline-separated Verified News Facts Block */}
-                    <div className="bg-[#F7F9FC] border border-slate-200 rounded-lg p-3.5 space-y-2">
-                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                        <span className="font-semibold text-[#165B52]">
-                          Sự kiện xác minh từ nguồn tin
-                        </span>
-                        <span className="text-slate-500 tabular-nums">
-                          {meta.sourceName} · {formatVerifiedDateVi(meta.publishedAt, lang)}
-                        </span>
-                      </div>
-                      <p className="text-xs text-slate-700 leading-relaxed">
-                        {meta.verifiedFactsSummaryVi}
-                      </p>
-                      <div className="pt-0.5">
-                        <a
-                          href={meta.articleUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 text-xs font-medium text-[#1E4178] hover:underline"
-                        >
-                          <span>Đọc bài gốc: {meta.originalTitle}</span>
-                          <ExternalLink className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                        </a>
-                      </div>
-                    </div>
-
-                    {/* Audio Segmentation Status & Vocabulary Preview */}
-                    <div className="space-y-2 text-xs">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <span
-                          className={
-                            audioReady ? 'text-[#165B52] font-medium' : 'text-amber-800 font-medium'
-                          }
-                        >
-                          {audioReady
-                            ? `Audio TTS sẵn sàng: ${meta.audioSegmentsCount ?? lesson.sentences.length} file câu (.wav)`
-                            : meta.audioError
-                              ? `Audio chưa tạo xong: ${meta.audioError}`
-                              : 'Chưa có file audio TTS lưu sẵn (có thể nghe bằng giọng trình duyệt hoặc thử tạo lại)'}
-                        </span>
-                        {isPersistedInDb && !audioReady && isOnline && (
-                          <button
-                            type="button"
-                            disabled={Boolean(retryingAudioId)}
-                            onClick={() => void handleRetryAudio(lesson.id)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 min-h-[36px] rounded-md border border-slate-200 text-xs font-semibold text-[#0F2342] hover:bg-slate-50 disabled:opacity-60"
-                          >
-                            {isRetryingAudio ? (
-                              <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
-                            ) : (
-                              <RefreshCw className="w-3.5 h-3.5" aria-hidden="true" />
-                            )}
-                            <span>{isRetryingAudio ? 'Đang xếp hàng / tạo audio...' : 'Thử tạo lại audio'}</span>
-                          </button>
-                        )}
-                      </div>
-
-                      {lesson.vocabulary.length > 0 && (
-                        <div className="text-slate-600">
-                          <span className="font-semibold text-[#0F2342]">Từ vựng trọng tâm: </span>
-                          <span className="cyrillic-prose">
-                            {lesson.vocabulary
-                              .slice(0, 5)
-                              .map((v) => v.word)
-                              .join(' · ')}
-                          </span>
-                          {lesson.vocabulary.length > 5 && (
-                            <span> · +{lesson.vocabulary.length - 5} từ khác</span>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Actions */}
-                  <div className="pt-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => toggleSaveLesson(lesson)}
-                        className={`inline-flex items-center gap-1.5 px-3 py-2 min-h-[44px] rounded-lg border text-xs font-medium transition-colors whitespace-nowrap ${
-                          savedLessonIds.has(lesson.id)
-                            ? 'bg-[#F2F6FC] text-[#0F2342] border-[#0F2342]/30'
-                            : 'border-slate-200 text-slate-700 hover:bg-slate-50'
-                        }`}
-                      >
-                        {savedLessonIds.has(lesson.id) ? (
-                          <>
-                            <BookmarkCheck className="w-3.5 h-3.5" aria-hidden="true" />
-                            <span>Đã lưu</span>
-                          </>
-                        ) : (
-                          <>
-                            <Bookmark className="w-3.5 h-3.5" aria-hidden="true" />
-                            <span>Lưu bài</span>
-                          </>
-                        )}
-                      </button>
-
-                      {offlineLessonIds.has(lesson.id) ? (
-                        <span className="inline-flex items-center gap-1.5 px-3 py-2 min-h-[44px] rounded-lg border border-[#1F7A6E]/30 bg-[#F2F9F8] text-xs font-medium text-[#165B52] whitespace-nowrap">
-                          <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" />
-                          <span>
-                            Ngoại tuyến{' '}
-                            {offlineRec && offlineRec.totalAudioBytes > 0
-                              ? `(${formatStorageBytes(offlineRec.totalAudioBytes)})`
-                              : ''}
-                          </span>
-                        </span>
-                      ) : (
-                        <button
-                          type="button"
-                          disabled={isDownloading}
-                          onClick={() => void handleDownloadOffline(lesson)}
-                          className="inline-flex items-center gap-1.5 px-3 py-2 min-h-[44px] rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-60 whitespace-nowrap"
-                        >
-                          {isDownloading ? (
-                            <>
-                              <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
-                              <span>
-                                {downloadProgress
-                                  ? `${downloadProgress.done}/${downloadProgress.total}`
-                                  : 'Đang tải'}
-                              </span>
-                            </>
-                          ) : (
-                            <>
-                              <Download className="w-3.5 h-3.5" aria-hidden="true" />
-                              <span>Tải ngoại tuyến</span>
-                            </>
-                          )}
-                        </button>
-                      )}
-
-                      {canDelete && (
-                        <button
-                          type="button"
-                          onClick={() => deleteLesson(lesson.id)}
-                          aria-label={`Xóa bài ${lesson.titleVi}`}
-                          className="inline-flex items-center justify-center min-w-[44px] min-h-[44px] rounded-lg border border-slate-200 text-slate-500 hover:text-red-700 hover:border-red-200"
-                        >
-                          <Trash2 className="w-4 h-4" aria-hidden="true" />
-                        </button>
-                      )}
-                    </div>
-
-                    <Link
-                      to={`/dictation/${lesson.id}`}
-                      className="inline-flex items-center gap-2 px-4 py-2 min-h-[44px] rounded-lg bg-[#0F2342] text-white text-xs font-semibold hover:bg-[#163059] transition-colors whitespace-nowrap"
-                    >
-                      <Headphones className="w-3.5 h-3.5" aria-hidden="true" />
-                      <span>Vào phòng luyện nghe chép</span>
-                      <ArrowRight className="w-3.5 h-3.5" aria-hidden="true" />
-                    </Link>
-                  </div>
-                </article>
-              );
-            })}
-          </div>
-        )}
-      </section>
 
       {/* SECTION 2: Verified RSS News Feed */}
       <section aria-label="Bản tin RSS xác thực" className="space-y-4">
@@ -1058,20 +828,22 @@ export const DailyNewsPage: React.FC = () => {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {filteredArticles.map((article) => {
               const isGenerating = generatingArticleId === article.id;
+              const chosenLevel = articleLevels[article.id] || 'B1';
+              const chosenFormat = articleFormats[article.id] || 'dialogue';
               const existingLesson = newsLessons.find(
                 (l) =>
                   (l.newsMetadata?.articleId === article.id ||
                     l.newsMetadata?.articleUrl === article.articleUrl) &&
-                  l.level === effectiveTargetLevel &&
-                  l.newsMetadata?.format === format,
+                  l.level === chosenLevel &&
+                  l.newsMetadata?.format === chosenFormat,
               );
 
               return (
                 <article
                   key={article.id}
-                  className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between gap-4 hover:border-slate-300 transition-colors"
+                  className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between gap-5 hover:border-slate-300 transition-colors"
                 >
-                  <div className="space-y-2.5">
+                  <div className="space-y-3">
                     <div className="flex flex-wrap items-center gap-1.5 text-xs text-slate-500">
                       <span className="font-semibold text-[#0F2342]">{article.sourceName}</span>
                       <span aria-hidden="true">·</span>
@@ -1101,51 +873,117 @@ export const DailyNewsPage: React.FC = () => {
                         {article.summarySnippet}
                       </p>
                     )}
+
+                    <div className="pt-1">
+                      <a
+                        href={article.articleUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-xs font-medium text-[#1E4178] hover:underline"
+                      >
+                        <span>Đọc bản tin gốc</span>
+                        <ExternalLink className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                      </a>
+                    </div>
                   </div>
 
-                  <div className="pt-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2">
-                    <a
-                      href={article.articleUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1.5 px-3 py-2 min-h-[44px] rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
-                    >
-                      <span>Đọc bài gốc</span>
-                      <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
-                    </a>
+                  <div className="pt-4 border-t border-slate-100 space-y-3">
+                    <div className="space-y-2">
+                      <div className="text-[11px] font-semibold text-slate-600">
+                        Chọn mức độ CEFR & định dạng để chuyển thành bài nghe:
+                      </div>
+                      <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Chọn cấp độ CEFR">
+                        {CEFR_LEVELS.map((lvl) => (
+                          <button
+                            key={lvl}
+                            type="button"
+                            onClick={() =>
+                              setArticleLevels((prev) => ({ ...prev, [article.id]: lvl }))
+                            }
+                            aria-pressed={chosenLevel === lvl}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                              chosenLevel === lvl
+                                ? 'bg-[#0F2342] text-white'
+                                : 'bg-slate-100 text-slate-600 hover:text-[#0F2342]'
+                            }`}
+                          >
+                            CEFR {lvl}
+                          </button>
+                        ))}
+                      </div>
 
-                    {existingLesson ? (
-                      <Link
-                        to={`/dictation/${existingLesson.id}`}
-                        className="inline-flex items-center gap-2 px-3.5 py-2 min-h-[44px] rounded-lg bg-[#1F7A6E] text-white text-xs font-semibold hover:bg-[#165B52] transition-colors whitespace-nowrap"
+                      <div
+                        className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg text-xs"
+                        role="group"
+                        aria-label="Chọn định dạng"
                       >
-                        <Headphones className="w-3.5 h-3.5" aria-hidden="true" />
-                        <span>Mở bài {existingLesson.level} đã lưu</span>
-                      </Link>
-                    ) : (
-                      <button
-                        type="button"
-                        disabled={
-                          Boolean(generatingArticleId) ||
-                          !isOnline ||
-                          (capabilities.loaded && !capabilities.geminiConfigured)
-                        }
-                        onClick={() => void handleGenerateLessonFromArticle(article)}
-                        className="inline-flex items-center gap-2 px-3.5 py-2 min-h-[44px] rounded-lg bg-[#0F2342] text-white text-xs font-semibold hover:bg-[#163059] disabled:opacity-55 transition-colors whitespace-nowrap"
-                      >
-                        {isGenerating ? (
-                          <>
-                            <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
-                            <span>Đang tạo bài {effectiveTargetLevel}...</span>
-                          </>
-                        ) : (
-                          <>
-                            <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
-                            <span>Tạo bài nghe CEFR {effectiveTargetLevel}</span>
-                          </>
-                        )}
-                      </button>
-                    )}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setArticleFormats((prev) => ({ ...prev, [article.id]: 'dialogue' }))
+                          }
+                          aria-pressed={chosenFormat === 'dialogue'}
+                          className={`flex-1 py-1.5 px-2 rounded-md font-medium transition-colors ${
+                            chosenFormat === 'dialogue'
+                              ? 'bg-white text-[#0F2342] shadow-xs'
+                              : 'text-slate-600'
+                          }`}
+                        >
+                          Hội thoại + Tóm tắt
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setArticleFormats((prev) => ({ ...prev, [article.id]: 'summary' }))
+                          }
+                          aria-pressed={chosenFormat === 'summary'}
+                          className={`flex-1 py-1.5 px-2 rounded-md font-medium transition-colors ${
+                            chosenFormat === 'summary'
+                              ? 'bg-white text-[#0F2342] shadow-xs'
+                              : 'text-slate-600'
+                          }`}
+                        >
+                          Bản tin tóm tắt
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="pt-2 flex items-center justify-end">
+                      {existingLesson ? (
+                        <Link
+                          to={`/dictation/${existingLesson.id}`}
+                          className="inline-flex items-center gap-2 px-4 py-2 min-h-[44px] rounded-lg bg-[#1F7A6E] text-white text-xs font-semibold hover:bg-[#165B52] transition-colors whitespace-nowrap"
+                        >
+                          <Headphones className="w-3.5 h-3.5" aria-hidden="true" />
+                          <span>Mở bài {existingLesson.level} đã tạo</span>
+                        </Link>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={
+                            Boolean(generatingArticleId) ||
+                            !isOnline ||
+                            (capabilities.loaded && !capabilities.geminiConfigured)
+                          }
+                          onClick={() =>
+                            void handleGenerateLessonFromArticle(article, chosenLevel, chosenFormat)
+                          }
+                          className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 min-h-[48px] rounded-xl bg-[#0F2342] text-white text-xs font-semibold hover:bg-[#163059] disabled:opacity-55 transition-colors shadow-sm"
+                        >
+                          {isGenerating ? (
+                            <>
+                              <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
+                              <span>Đang tạo bài {chosenLevel} ({chosenFormat === 'dialogue' ? 'Hội thoại' : 'Bản tin'})...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Sparkles className="w-4 h-4" aria-hidden="true" />
+                              <span>Tạo bài nghe CEFR {chosenLevel} ({chosenFormat === 'dialogue' ? 'Hội thoại' : 'Bản tin'})</span>
+                            </>
+                          )}
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </article>
               );

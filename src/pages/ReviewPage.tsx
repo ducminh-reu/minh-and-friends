@@ -10,6 +10,7 @@ import {
   getRetentionRate,
   selectReviewQueue,
 } from '../utils/spacedRepetition';
+import { getDefaultRussianNarratorSpeaker } from '../utils/voiceRegistry';
 
 const ALL_FORMATS: ReviewFormat[] = [
   'ru_to_vi',
@@ -32,6 +33,7 @@ export const ReviewPage: React.FC = () => {
   const [revealed, setRevealed] = useState(false);
   const [answerCorrect, setAnswerCorrect] = useState<boolean | null>(null);
   const [sessionStats, setSessionStats] = useState({ reviewed: 0, correct: 0 });
+  const [audioNotice, setAudioNotice] = useState<string | null>(null);
 
   const queue = useMemo(() => selectReviewQueue(vocabulary, new Date().toISOString(), 20), [vocabulary]);
   const dueCount = useMemo(
@@ -171,18 +173,27 @@ export const ReviewPage: React.FC = () => {
                 </p>
                 <button
                   type="button"
-                  onClick={() =>
+                  onClick={() => {
+                    setAudioNotice(null);
                     void russianAudioEngine.playSentence({
                       text: currentRecord.word,
+                      speaker: getDefaultRussianNarratorSpeaker('female'),
                       speed: 1,
-                      preferServerTts: capabilities.ttsAvailable && isOnline,
-                    })
-                  }
+                      preferServerTts:
+                        profile.ttsPreference === 'auto' && capabilities.ttsAvailable && isOnline,
+                      onError: (msg) => setAudioNotice(msg),
+                    });
+                  }}
                   className="inline-flex items-center justify-center gap-2 px-4 min-h-[44px] rounded-lg bg-[#0F2342] text-white text-sm font-medium hover:bg-[#163059]"
                 >
                   <Volume2 className="w-4 h-4" aria-hidden="true" />
                   <span>Nghe từ vựng</span>
                 </button>
+                {audioNotice && (
+                  <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                    {audioNotice}
+                  </p>
+                )}
               </div>
             ) : (
               <>
@@ -303,13 +314,17 @@ export const ReviewPage: React.FC = () => {
 
                 <button
                   type="button"
-                  onClick={() =>
+                  onClick={() => {
+                    setAudioNotice(null);
                     void russianAudioEngine.playSentence({
                       text: currentRecord.word,
+                      speaker: getDefaultRussianNarratorSpeaker('female'),
                       speed: 1,
-                      preferServerTts: capabilities.ttsAvailable && isOnline,
-                    })
-                  }
+                      preferServerTts:
+                        profile.ttsPreference === 'auto' && capabilities.ttsAvailable && isOnline,
+                      onError: (msg) => setAudioNotice(msg),
+                    });
+                  }}
                   aria-label="Phát âm đáp án"
                   className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 shrink-0"
                 >
